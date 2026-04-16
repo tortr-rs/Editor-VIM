@@ -1,6 +1,6 @@
 # evim
 
-A modal CLI text editor inspired by Vim, built with Python and curses. Features syntax highlighting, themes, auto-completion, and a custom scripting language called evimlang.
+**Editor_VIM** – A modal CLI text editor inspired by Vim, built with Python and curses. Features syntax highlighting, themes, auto-completion, and a custom scripting language called evimlang.
 
 ## Features
 
