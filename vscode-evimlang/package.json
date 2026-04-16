@@ -1,0 +1,26 @@
+{
+  "name": "evimlang-syntax",
+  "displayName": "evimlang Syntax Highlighting",
+  "description": "Syntax highlighting for evimlang configuration files",
+  "version": "0.0.1",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [{
+      "id": "evimlang",
+      "aliases": ["evimlang", "evimrc"],
+      "extensions": [".evimrc"],
+      "configuration": "./language-configuration.json"
+    }],
+    "grammars": [{
+      "language": "evimlang",
+      "scopeName": "source.evimlang",
+      "path": "./syntaxes/evimlang.tmLanguage.json"
+    }]
+  }
+}

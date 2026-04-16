@@ -1,0 +1,11 @@
+
+" evimlang config file - custom scripting for evim editor
+
+set theme matrix_code
+
+set numbers
+
+set relativenumber
+map normal <F1> :help
+
+python editor.message = 'Config LOaded'
