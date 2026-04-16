@@ -19,7 +19,7 @@ Requires Python 3 and the `curses` library (usually included with Python).
 
 ```bash
 # Clone the repo
-git clone https://github.com/yourusername/evim.git
+git clone https://github.com/tortr-rs/evim.git
 cd evim
 
 # Run
