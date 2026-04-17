@@ -1,0 +1,690 @@
+#!/usr/bin/env python3
+"""
+evimlang interpreter — standalone
+Runs .evimrc / .evimlang scripts without launching the editor.
+
+Usage:
+    python3 evimlang.py [script.evimlang]
+    python3 evimlang.py          # reads from stdin
+"""
+
+import sys
+import re
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Token types
+# ---------------------------------------------------------------------------
+TK_CMD    = "CMD"
+TK_STRING = "STRING"
+TK_NUMBER = "NUMBER"
+TK_IDENT  = "IDENT"
+TK_BOOL   = "BOOL"
+TK_EOF    = "EOF"
+
+
+class Token:
+    def __init__(self, type_, value, line=0):
+        self.type  = type_
+        self.value = value
+        self.line  = line
+
+    def __repr__(self):
+        return f"Token({self.type}, {self.value!r})"
+
+
+# ---------------------------------------------------------------------------
+# Lexer
+# ---------------------------------------------------------------------------
+class Lexer:
+    """Tokenise a single line of evimlang source."""
+
+    def tokenise_line(self, line: str, lineno: int) -> list[Token]:
+        tokens: list[Token] = []
+        i = 0
+        while i < len(line):
+            # skip whitespace
+            if line[i].isspace():
+                i += 1
+                continue
+            # comment: " starts a line comment
+            if line[i] == '"':
+                break
+            # quoted string
+            if line[i] in ('"', "'"):  # noqa: SIM114  (kept separate for clarity)
+                quote = line[i]
+                i += 1
+                start = i
+                while i < len(line) and line[i] != quote:
+                    if line[i] == '\\':
+                        i += 1  # skip escaped char
+                    i += 1
+                value = line[start:i]
+                i += 1  # closing quote
+                tokens.append(Token(TK_STRING, value, lineno))
+                continue
+            # number
+            m = re.match(r'-?\d+(\.\d+)?', line[i:])
+            if m:
+                raw = m.group()
+                value = float(raw) if '.' in raw else int(raw)
+                tokens.append(Token(TK_NUMBER, value, lineno))
+                i += len(raw)
+                continue
+            # identifier / keyword
+            m = re.match(r'[A-Za-z_][\w]*', line[i:])
+            if m:
+                word = m.group()
+                if word in ('true', 'false', 'on', 'off', 'yes', 'no'):
+                    tokens.append(Token(TK_BOOL, word in ('true', 'on', 'yes'), lineno))
+                else:
+                    tokens.append(Token(TK_IDENT, word, lineno))
+                i += len(word)
+                continue
+            # anything else is a raw token (e.g. punctuation, key combos like <F1>)
+            m = re.match(r'\S+', line[i:])
+            if m:
+                tokens.append(Token(TK_IDENT, m.group(), lineno))
+                i += len(m.group())
+                continue
+            i += 1
+        tokens.append(Token(TK_EOF, None, lineno))
+        return tokens
+
+
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
+class Environment:
+    """Holds variables / options for the interpreter session."""
+
+    def __init__(self, parent=None):
+        self._vars: dict = {}
+        self._parent: 'Environment | None' = parent
+
+    def set(self, name: str, value):
+        self._vars[name] = value
+
+    def get(self, name: str, default=None):
+        if name in self._vars:
+            return self._vars[name]
+        if self._parent:
+            return self._parent.get(name, default)
+        return default
+
+    def all_vars(self) -> dict:
+        merged = {}
+        if self._parent:
+            merged.update(self._parent.all_vars())
+        merged.update(self._vars)
+        return merged
+
+    def __repr__(self):
+        return f"Environment({self._vars})"
+
+
+# ---------------------------------------------------------------------------
+# Built-in commands (stand-alone mode — no editor object)
+# ---------------------------------------------------------------------------
+
+def _builtin_echo(args, env, interp):
+    print(" ".join(str(a) for a in args))
+
+def _builtin_set(args, env, interp):
+    if not args:
+        # print all options
+        for k, v in env.all_vars().items():
+            print(f"  {k} = {v!r}")
+        return
+    name = str(args[0])
+    if name.startswith("no"):
+        key = name[2:]
+        env.set(key, False)
+        if interp.editor_bridge and "set" in interp.editor_bridge:
+            interp.editor_bridge["set"](key, False)
+    elif len(args) >= 2:
+        env.set(name, args[1])
+        if interp.editor_bridge and "set" in interp.editor_bridge:
+            interp.editor_bridge["set"](name, args[1])
+    else:
+        env.set(name, True)
+        if interp.editor_bridge and "set" in interp.editor_bridge:
+            interp.editor_bridge["set"](name, True)
+
+def _builtin_let(args, env, interp):
+    # let varname = value
+    if len(args) < 3 or args[1] != "=":
+        raise EvimLangError("let: syntax is 'let <name> = <value>'")
+    env.set(str(args[0]), args[2])
+
+def _builtin_if(args, env, interp):
+    # This is handled at parse level; placeholder
+    pass
+
+def _builtin_map(args, env, interp):
+    if len(args) < 3:
+        raise EvimLangError("map: need <mode> <key> <action...>")
+    mode   = str(args[0])
+    key    = str(args[1])
+    action = " ".join(str(a) for a in args[2:])
+    interp.keymaps.setdefault(mode, {})[key] = action
+    if interp.verbose:
+        print(f"  map: [{mode}] {key!r} -> {action!r}")
+    # Fire editor bridge if present
+    if interp.editor_bridge and "map" in interp.editor_bridge:
+        interp.editor_bridge["map"](mode, key, action)
+
+def _builtin_unmap(args, env, interp):
+    if len(args) < 2:
+        return
+    mode = str(args[0])
+    key  = str(args[1])
+    interp.keymaps.get(mode, {}).pop(key, None)
+
+def _builtin_source(args, env, interp):
+    if not args:
+        raise EvimLangError("source: need a filename")
+    path = Path(str(args[0])).expanduser()
+    if not path.exists():
+        raise EvimLangError(f"source: file not found: {path}")
+    interp.run_file(path)
+
+def _builtin_python(args, env, interp):
+    code = " ".join(str(a) for a in args)
+    exec_globals = {"env": env, "interp": interp, "print": print}
+    if interp.editor_bridge and "editor" in interp.editor_bridge:
+        exec_globals["editor"] = interp.editor_bridge["editor"]
+    try:
+        exec(code, exec_globals)  # noqa: S102
+    except Exception as exc:
+        raise EvimLangError(f"python: {exc}") from exc
+
+def _builtin_print(args, env, interp):
+    print(" ".join(str(a) for a in args))
+
+def _builtin_theme(args, env, interp):
+    if args:
+        env.set("theme", str(args[0]))
+        if interp.verbose:
+            print(f"  theme set to: {args[0]}")
+        if interp.editor_bridge and "theme" in interp.editor_bridge:
+            interp.editor_bridge["theme"](str(args[0]))
+
+def _builtin_colorscheme(args, env, interp):
+    _builtin_theme(args, env, interp)
+
+def _builtin_syntax(args, env, interp):
+    if args:
+        env.set("syntax", str(args[0]))
+        if interp.verbose:
+            print(f"  syntax: {args[0]}")
+
+def _builtin_tabstop(args, env, interp):
+    if args:
+        try:
+            val = int(args[0])
+            env.set("tabstop", val)
+            if interp.editor_bridge and "set" in interp.editor_bridge:
+                interp.editor_bridge["set"]("tabstop", val)
+        except ValueError:
+            raise EvimLangError(f"tabstop: expected integer, got {args[0]!r}")
+
+def _builtin_autonumber(args, env, interp):
+    env.set("number", True)
+    if interp.editor_bridge and "set" in interp.editor_bridge:
+        interp.editor_bridge["set"]("number", True)
+
+def _builtin_nonumber(args, env, interp):
+    env.set("number", False)
+    if interp.editor_bridge and "set" in interp.editor_bridge:
+        interp.editor_bridge["set"]("number", False)
+
+
+BUILTINS = {
+    "echo":        _builtin_echo,
+    "print":       _builtin_print,
+    "set":         _builtin_set,
+    "let":         _builtin_let,
+    "map":         _builtin_map,
+    "unmap":       _builtin_unmap,
+    "source":      _builtin_source,
+    "python":      _builtin_python,
+    "theme":       _builtin_theme,
+    "colorscheme": _builtin_colorscheme,
+    "syntax":      _builtin_syntax,
+    "tabstop":     _builtin_tabstop,
+    "number":      _builtin_autonumber,
+    "nonumber":    _builtin_nonumber,
+}
+
+
+# ---------------------------------------------------------------------------
+# Error
+# ---------------------------------------------------------------------------
+class EvimLangError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Interpreter
+# ---------------------------------------------------------------------------
+class Interpreter:
+    """
+    Full evimlang interpreter.
+
+    Supported language features
+    ---------------------------
+    * Comments:       " this is a comment
+    * Options:        set number | set tabstop 4 | set nonumber
+    * Variables:      let x = 42
+    * Echo:           echo "hello"
+    * Key maps:       map normal <F1> :help
+    * Source:         source ~/.evimrc
+    * Python inline:  python print("hi")
+    * Theme:          theme gruvbox
+    * If/else/endif:  if <expr> / elseif / else / endif
+    * While/endwhile: while <expr> / endwhile
+    * Functions:      function Name() / return / endfunction
+    * Call:           call Name()
+    * Expressions:    +  -  *  /  ==  !=  <  >  <=  >=  and  or  not
+    """
+
+    def __init__(self, verbose=False):
+        self.env      = Environment()
+        self.keymaps: dict[str, dict[str, str]] = {}
+        self.functions: dict[str, dict] = {}   # name -> {params, body_lines}
+        self.verbose  = verbose
+        self._lexer   = Lexer()
+        # Optional editor callbacks: {"set": fn(k,v), "theme": fn(name), "map": fn(mode,key,action), "editor": editor_obj}
+        self.editor_bridge: dict | None = None
+        # Seed defaults
+        self.env.set("tabstop",  4)
+        self.env.set("number",   False)
+        self.env.set("theme",    "default")
+        self.env.set("syntax",   "on")
+        self.env.set("wrap",     True)
+        self.env.set("autoindent", True)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def run_file(self, path: Path):
+        source = path.read_text(encoding="utf-8")
+        self.run(source, filename=str(path))
+
+    def run(self, source: str, filename: str = "<string>"):
+        lines = source.splitlines()
+        self._exec_block(lines, 0, len(lines), filename)
+
+    # ------------------------------------------------------------------
+    # Block executor (handles if/while/function blocks)
+    # ------------------------------------------------------------------
+
+    def _exec_block(self, lines: list[str], start: int, end: int, filename: str) -> int:
+        """Execute lines[start:end], return index after consumed lines."""
+        i = start
+        while i < end:
+            line = lines[i].strip()
+            i += 1
+            if not line or line.startswith('"'):
+                continue
+
+            tokens = self._lexer.tokenise_line(line, i)
+            if not tokens or tokens[0].type == TK_EOF:
+                continue
+
+            cmd = tokens[0].value
+
+            # --- function definition ---
+            if cmd == "function":
+                name, params, body, new_i = self._collect_function(lines, i - 1, end, filename)
+                self.functions[name] = {"params": params, "body": body, "file": filename}
+                i = new_i
+                continue
+
+            # --- if block ---
+            if cmd == "if":
+                new_i = self._exec_if(lines, i - 1, end, filename)
+                i = new_i
+                continue
+
+            # --- while block ---
+            if cmd == "while":
+                new_i = self._exec_while(lines, i - 1, end, filename)
+                i = new_i
+                continue
+
+            # --- call ---
+            if cmd == "call":
+                rest_tokens = tokens[1:-1]  # drop EOF
+                self._exec_call(rest_tokens, filename, i)
+                continue
+
+            # --- return (top-level: just stop) ---
+            if cmd == "return":
+                break
+
+            # --- regular command ---
+            try:
+                self._exec_tokens(tokens, filename, i)
+            except EvimLangError as exc:
+                print(f"{filename}:{i}: error: {exc}", file=sys.stderr)
+
+        return i
+
+    # ------------------------------------------------------------------
+    # if / elseif / else / endif
+    # ------------------------------------------------------------------
+
+    def _exec_if(self, lines: list[str], start: int, end: int, filename: str) -> int:
+        """Handle an if..elseif..else..endif block. Returns index after endif."""
+        # Collect all branches: list of (condition_tokens | None, body_lines)
+        branches: list[tuple] = []
+        current_cond_tokens = None
+        current_body: list[str] = []
+        depth = 0
+        i = start
+        first = True
+
+        while i < end:
+            raw = lines[i].strip()
+            i += 1
+            toks = self._lexer.tokenise_line(raw, i)
+            cmd  = toks[0].value if toks and toks[0].type != TK_EOF else ""
+
+            if first:
+                # "if <expr>"
+                current_cond_tokens = toks[1:-1]  # drop EOF
+                first = False
+                continue
+
+            if cmd in ("if", "while", "function"):
+                depth += 1
+            elif cmd == "endif" and depth == 0:
+                branches.append((current_cond_tokens, current_body))
+                break
+            elif cmd == "elseif" and depth == 0:
+                branches.append((current_cond_tokens, current_body))
+                current_cond_tokens = toks[1:-1]
+                current_body = []
+                continue
+            elif cmd == "else" and depth == 0:
+                branches.append((current_cond_tokens, current_body))
+                current_cond_tokens = None   # else branch
+                current_body = []
+                continue
+            elif cmd in ("endif", "endwhile", "endfunction") and depth > 0:
+                depth -= 1
+
+            current_body.append(raw)
+
+        # Execute first matching branch
+        for cond_toks, body in branches:
+            if cond_toks is None:  # else
+                self._exec_block(body, 0, len(body), filename)
+                break
+            val = self._eval_tokens(cond_toks, filename, 0)
+            if self._truthy(val):
+                self._exec_block(body, 0, len(body), filename)
+                break
+
+        return i
+
+    # ------------------------------------------------------------------
+    # while / endwhile
+    # ------------------------------------------------------------------
+
+    def _exec_while(self, lines: list[str], start: int, end: int, filename: str) -> int:
+        first_line = lines[start].strip()
+        first_toks = self._lexer.tokenise_line(first_line, start + 1)
+        cond_tokens = first_toks[1:-1]  # drop EOF
+
+        # Collect body
+        body: list[str] = []
+        depth = 0
+        i = start + 1
+        while i < end:
+            raw = lines[i].strip()
+            i += 1
+            toks = self._lexer.tokenise_line(raw, i)
+            cmd  = toks[0].value if toks and toks[0].type != TK_EOF else ""
+            if cmd in ("if", "while", "function"):
+                depth += 1
+            elif cmd == "endwhile" and depth == 0:
+                break
+            elif cmd in ("endif", "endwhile", "endfunction") and depth > 0:
+                depth -= 1
+            body.append(raw)
+
+        # Execute loop (safety limit)
+        limit = 100_000
+        count = 0
+        while self._truthy(self._eval_tokens(cond_tokens, filename, start)):
+            self._exec_block(body, 0, len(body), filename)
+            count += 1
+            if count >= limit:
+                print(f"{filename}:{start+1}: error: while loop exceeded {limit} iterations", file=sys.stderr)
+                break
+
+        return i
+
+    # ------------------------------------------------------------------
+    # function definition / call
+    # ------------------------------------------------------------------
+
+    def _collect_function(self, lines: list[str], start: int, end: int, filename: str):
+        first_line = lines[start].strip()
+        m = re.match(r'function\s+(\w+)\s*\(([^)]*)\)', first_line)
+        if not m:
+            raise EvimLangError(f"Invalid function definition: {first_line!r}")
+        name   = m.group(1)
+        params = [p.strip() for p in m.group(2).split(',') if p.strip()]
+
+        body: list[str] = []
+        depth = 0
+        i = start + 1
+        while i < end:
+            raw = lines[i].strip()
+            i += 1
+            toks = self._lexer.tokenise_line(raw, i)
+            cmd  = toks[0].value if toks and toks[0].type != TK_EOF else ""
+            if cmd in ("if", "while", "function"):
+                depth += 1
+            elif cmd == "endfunction" and depth == 0:
+                break
+            elif cmd in ("endif", "endwhile", "endfunction") and depth > 0:
+                depth -= 1
+            body.append(raw)
+
+        return name, params, body, i
+
+    def _exec_call(self, tokens: list[Token], filename: str, lineno: int):
+        if not tokens:
+            return
+        name = tokens[0].value
+        arg_tokens = tokens[1:]  # simplified: positional args as tokens
+        args = [self._resolve_token(t) for t in arg_tokens if t.type != TK_EOF]
+
+        if name in self.functions:
+            fn = self.functions[name]
+            child_env = Environment(parent=self.env)
+            for param, val in zip(fn["params"], args):
+                child_env.set(param, val)
+            # swap env
+            saved = self.env
+            self.env = child_env
+            self._exec_block(fn["body"], 0, len(fn["body"]), fn["file"])
+            self.env = saved
+        elif name in BUILTINS:
+            BUILTINS[name](args, self.env, self)
+        else:
+            print(f"{filename}:{lineno}: error: unknown function '{name}'", file=sys.stderr)
+
+    # ------------------------------------------------------------------
+    # Execute a tokenised command line
+    # ------------------------------------------------------------------
+
+    def _exec_tokens(self, tokens: list[Token], filename: str, lineno: int):
+        if not tokens or tokens[0].type == TK_EOF:
+            return
+        cmd = tokens[0].value
+        raw_args = tokens[1:-1]  # strip EOF
+
+        # let varname = value  (special syntax)
+        if cmd == "let" and len(raw_args) >= 3 and raw_args[1].value == "=":
+            varname = str(raw_args[0].value)
+            value   = self._eval_tokens(raw_args[2:], filename, lineno)
+            self.env.set(varname, value)
+            return
+
+        # resolve args
+        args = self._eval_arg_list(raw_args, filename, lineno)
+
+        if cmd in BUILTINS:
+            BUILTINS[cmd](args, self.env, self)
+        elif cmd in self.functions:
+            self._exec_call([tokens[0]] + raw_args, filename, lineno)
+        else:
+            # unknown: try as set shorthand   e.g.  "tabstop 4"
+            if len(args) == 1:
+                self.env.set(cmd, args[0])
+            elif len(args) == 0:
+                # treat as boolean set
+                if cmd.startswith("no"):
+                    self.env.set(cmd[2:], False)
+                else:
+                    self.env.set(cmd, True)
+            else:
+                print(f"{filename}:{lineno}: warning: unknown command '{cmd}'", file=sys.stderr)
+
+    # ------------------------------------------------------------------
+    # Expression evaluator
+    # ------------------------------------------------------------------
+
+    def _eval_arg_list(self, tokens: list[Token], filename: str, lineno: int) -> list:
+        """Resolve each token to a value (no infix ops — just literals/vars)."""
+        return [self._resolve_token(t) for t in tokens if t.type != TK_EOF]
+
+    def _resolve_token(self, token: Token):
+        if token.type == TK_STRING:
+            return token.value
+        if token.type == TK_NUMBER:
+            return token.value
+        if token.type == TK_BOOL:
+            return token.value
+        if token.type == TK_IDENT:
+            # check env variable
+            val = self.env.get(token.value)
+            if val is not None:
+                return val
+            return token.value
+        return token.value
+
+    def _eval_tokens(self, tokens: list[Token], filename: str, lineno: int):
+        """Evaluate an expression from tokens. Supports: literals, variables,
+        binary ops (+,-,*,/,==,!=,<,>,<=,>=), logical ops (and,or,not)."""
+        expr_str = self._tokens_to_expr(tokens)
+        if not expr_str.strip():
+            return None
+        try:
+            # Build a safe eval context from current env vars
+            ctx = dict(self.env.all_vars())
+            # map evimlang truthiness words
+            ctx.update({"true": True, "false": False, "on": True, "off": False,
+                        "yes": True, "no": False, "and": "and", "or": "or", "not": "not"})
+            # safe eval — restrict builtins
+            result = eval(expr_str, {"__builtins__": {}}, ctx)  # noqa: S307
+            return result
+        except Exception:
+            # fallback: return raw string
+            return expr_str
+
+    def _tokens_to_expr(self, tokens: list[Token]) -> str:
+        parts = []
+        for t in tokens:
+            if t.type == TK_EOF:
+                continue
+            if t.type == TK_STRING:
+                parts.append(repr(t.value))
+            elif t.type == TK_BOOL:
+                parts.append("True" if t.value else "False")
+            elif t.type == TK_IDENT and t.value in ("and", "or", "not"):
+                parts.append(t.value)
+            else:
+                parts.append(str(t.value))
+        return " ".join(parts)
+
+    @staticmethod
+    def _truthy(val) -> bool:
+        if val is None or val is False or val == 0 or val == "" or val == "false" or val == "off":
+            return False
+        return True
+
+
+# ---------------------------------------------------------------------------
+# REPL
+# ---------------------------------------------------------------------------
+
+def repl(interp: Interpreter):
+    print("evimlang REPL  (type 'exit' or Ctrl-D to quit)")
+    while True:
+        try:
+            line = input("evimlang> ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if line.strip() in ("exit", "quit"):
+            break
+        try:
+            interp.run(line)
+        except EvimLangError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    args = sys.argv[1:]
+    verbose = "--verbose" in args or "-v" in args
+    args = [a for a in args if a not in ("--verbose", "-v")]
+
+    interp = Interpreter(verbose=verbose)
+
+    if args:
+        for filepath in args:
+            path = Path(filepath).expanduser()
+            if not path.exists():
+                print(f"evimlang: file not found: {path}", file=sys.stderr)
+                sys.exit(1)
+            try:
+                interp.run_file(path)
+            except EvimLangError as exc:
+                print(f"evimlang: {exc}", file=sys.stderr)
+                sys.exit(1)
+    elif not sys.stdin.isatty():
+        source = sys.stdin.read()
+        try:
+            interp.run(source, filename="<stdin>")
+        except EvimLangError as exc:
+            print(f"evimlang: {exc}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        repl(interp)
+
+    if verbose:
+        print("\n--- Final environment ---")
+        for k, v in sorted(interp.env.all_vars().items()):
+            print(f"  {k} = {v!r}")
+        if interp.keymaps:
+            print("--- Key maps ---")
+            for mode, maps in interp.keymaps.items():
+                for key, action in maps.items():
+                    print(f"  [{mode}] {key!r} -> {action!r}")
+
+
+if __name__ == "__main__":
+    main()

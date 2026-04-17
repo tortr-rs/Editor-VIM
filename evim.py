@@ -120,6 +120,13 @@ class Editor:
         self.term_lines = [""]  # scrollback buffer
         self.term_scroll = 0  # scroll offset within terminal output
         self.term_col = 0  # cursor column within current line (for \r handling)
+        # Precompiled ANSI escape regex for terminal output stripping
+        self._ansi_re = re.compile(
+            r'\x1b\[[0-9;]*[a-zA-Z]'
+            r'|\x1b\][^\x07]*\x07'
+            r'|\x1b[()][AB012]'
+            r'|\x1b\[\?[0-9;]*[a-zA-Z]'
+        )
         # File explorer
         self.explorer_visible = False
         self.explorer_width = 25
@@ -196,7 +203,7 @@ class Editor:
         if prefix in self.snippets:
             candidates = [self.snippets[prefix]]
         else:
-            keywords = set(self.get_keyword_sets(self.syntax_language))
+            keywords = set(self._cached_keywords)
             if not self.cached_variables:
                 for l in self.lines:
                     words = re.findall(r'\b[a-zA-Z_]\w*\b', l)
@@ -397,6 +404,7 @@ class Editor:
         }
         self.syntax_language = extension_map.get(self.filetype, None)
         self.snippets = {}
+        self.cached_variables.clear()
         if self.syntax_language == "python":
             self.snippets = {
                 "if": "if :",
@@ -463,6 +471,9 @@ class Editor:
                 "class": "class  {\n\t\n}",
             }
         # Add more as needed
+        # Cache keyword and type sets for syntax highlighting performance
+        self._cached_keywords = set(self.get_keyword_sets(self.syntax_language)) if self.syntax_language else set()
+        self._cached_types = set(self.get_type_words(self.syntax_language)) if self.syntax_language else set()
 
     def get_keyword_sets(self, lang):
         default = {
@@ -1004,9 +1015,9 @@ class Editor:
                 token = content[start:pos]
                 token_key = token if lang not in ("fortran", "pascal") else token.lower()
                 attr = self.color_default
-                if token_key in self.get_keyword_sets(lang):
+                if token_key in self._cached_keywords:
                     attr = self.color_keyword
-                elif token_key in self.get_type_words(lang):
+                elif token_key in self._cached_types:
                     attr = self.color_type
                 self.draw_segment(stdscr, y, x, token, attr, cursor_col, base=start)
                 x += len(token)
@@ -1503,13 +1514,22 @@ class Editor:
         if self.mode == "command" and self.options.get("show_command"):
             command_line = ":" + self.command
             cmdline_padded = command_line[:width - 1].ljust(width - 1)
-            stdscr.addstr(height - 1, 0, cmdline_padded, cmd_attr)
+            try:
+                stdscr.addstr(height - 1, 0, cmdline_padded, cmd_attr)
+            except curses.error:
+                pass
         elif self.macro_recording:
             rec = f"recording @{self.macro_recording}"
-            stdscr.addstr(height - 1, 0, rec[:width - 1].ljust(width - 1), cmd_attr)
+            try:
+                stdscr.addstr(height - 1, 0, rec[:width - 1].ljust(width - 1), cmd_attr)
+            except curses.error:
+                pass
         else:
             hint = "Press : for commands, i for insert, ESC to return."
-            stdscr.addstr(height - 1, 0, hint[:width - 1].ljust(width - 1), cmd_attr)
+            try:
+                stdscr.addstr(height - 1, 0, hint[:width - 1].ljust(width - 1), cmd_attr)
+            except curses.error:
+                pass
         line = self.lines[self.cy] if self.cy < len(self.lines) else ""
         display_cx = 0
         for i in range(min(self.cx, len(line))):
@@ -2410,26 +2430,6 @@ class Editor:
         self.cx = indent
         self.mark_dirty()
 
-    def calculate_indent(self, line_idx):
-        if line_idx == 0 or not self.syntax_language:
-            return 0
-        prev_line = self.lines[line_idx - 1]
-        indent = len(prev_line) - len(prev_line.lstrip())
-        stripped = prev_line.rstrip()
-        if self.syntax_language in ("c", "cpp", "csharp", "rust", "java"):
-            if stripped.endswith("{"):
-                indent += self.options["tabsize"]
-        elif self.syntax_language == "python":
-            if stripped.endswith(":"):
-                indent += self.options["tabsize"]
-        elif self.syntax_language == "lua":
-            if stripped.endswith("then") or stripped.endswith("do") or stripped.endswith("function"):
-                indent += self.options["tabsize"]
-        elif self.syntax_language == "pascal":
-            if stripped.endswith("begin"):
-                indent += self.options["tabsize"]
-        return indent
-
     def calculate_indent(self, line_no):
         if not self.syntax_language:
             return 0
@@ -2886,7 +2886,6 @@ class Editor:
 
     def mark_dirty(self):
         self.dirty = True
-        self.cached_variables.clear()
 
     def undo(self):
         if not self.history:
@@ -3222,15 +3221,23 @@ class Editor:
             self.macro_keys = []
 
     def play_macro(self, reg, stdscr):
+        if not hasattr(self, '_macro_depth'):
+            self._macro_depth = 0
+        if self._macro_depth > 100:
+            self.message = "Macro recursion limit reached"
+            return
         keys = self.macros.get(reg)
         if not keys:
             self.message = f"Empty macro @{reg}"
             return
+        self._macro_depth += 1
         self.macro_playing = True
         for k in keys:
             self._inject_key = k
             self.handle_key(stdscr)
-        self.macro_playing = False
+        self._macro_depth -= 1
+        if self._macro_depth == 0:
+            self.macro_playing = False
         self._inject_key = None
         self.message = f"Played @{reg}"
 
@@ -3325,24 +3332,30 @@ class Editor:
     def fuzzy_find(self, stdscr):
         query = ""
         selected = 0
+        # Scan files once before the input loop
+        try:
+            all_files = sorted(
+                str(p) for p in Path('.').rglob('*')
+                if p.is_file() and not any(part.startswith('.') for part in p.parts)
+            )
+        except Exception:
+            all_files = []
         while True:
             height, width = stdscr.getmaxyx()
             stdscr.erase()
             stdscr.addstr(0, 0, f"Find file: {query}_"[:width-1], curses.A_BOLD)
             try:
-                files = []
-                for p in Path('.').rglob('*'):
-                    if p.is_file() and not any(part.startswith('.') for part in p.parts):
-                        files.append(str(p))
                 if query:
                     ql = query.lower()
                     scored = []
-                    for f in files:
+                    for f in all_files:
                         fl = f.lower()
                         if ql in fl:
                             scored.append((fl.index(ql), f))
                     scored.sort()
                     files = [s[1] for s in scored]
+                else:
+                    files = all_files
                 files = files[:height - 3]
             except Exception:
                 files = []
@@ -3462,6 +3475,13 @@ class Editor:
             except Exception:
                 if self.lsp_process:
                     self.lsp_process.kill()
+            # Close pipes to avoid resource leaks
+            for pipe in (self.lsp_process.stdin, self.lsp_process.stdout, self.lsp_process.stderr):
+                if pipe:
+                    try:
+                        pipe.close()
+                    except Exception:
+                        pass
             self.lsp_process = None
         self.lsp_enabled = False
         self.lsp_initialized = False
@@ -3537,6 +3557,11 @@ class Editor:
                 # Response to our request
                 rid = msg["id"]
                 self.lsp_responses[rid] = msg
+                # Prune old responses to prevent memory leak
+                if len(self.lsp_responses) > 50:
+                    oldest_keys = sorted(self.lsp_responses.keys())[:25]
+                    for k in oldest_keys:
+                        self.lsp_responses.pop(k, None)
                 result = msg.get("result", {})
                 # Handle initialize response
                 if result and "capabilities" in result:
@@ -3797,19 +3822,28 @@ class Editor:
             fcntl.ioctl(pid, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
         except OSError:
             pass
-        self.term_pid = os.fork()
-        if self.term_pid == 0:
+        try:
+            self.term_pid = os.fork()
+        except OSError:
             os.close(pid)
-            os.setsid()
-            os.dup2(fd, 0)
-            os.dup2(fd, 1)
-            os.dup2(fd, 2)
-            if fd > 2:
-                os.close(fd)
-            os.environ['TERM'] = 'dumb'
-            os.environ['COLUMNS'] = str(cols)
-            os.environ['LINES'] = str(rows)
-            os.execvp(shell, [shell, '--noediting'])
+            os.close(fd)
+            self.message = "Failed to fork terminal"
+            return
+        if self.term_pid == 0:
+            try:
+                os.close(pid)
+                os.setsid()
+                os.dup2(fd, 0)
+                os.dup2(fd, 1)
+                os.dup2(fd, 2)
+                if fd > 2:
+                    os.close(fd)
+                os.environ['TERM'] = 'dumb'
+                os.environ['COLUMNS'] = str(cols)
+                os.environ['LINES'] = str(rows)
+                os.execvp(shell, [shell, '--noediting'])
+            except Exception:
+                os._exit(127)
         else:
             os.close(fd)
             self.term_fd = pid
@@ -3837,10 +3871,7 @@ class Editor:
                     return
                 text = data.decode('utf-8', errors='replace')
                 # Strip ANSI escape sequences (we don't emulate a full VT)
-                text = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
-                text = re.sub(r'\x1b\][^\x07]*\x07', '', text)
-                text = re.sub(r'\x1b[()][AB012]', '', text)
-                text = re.sub(r'\x1b\[\?[0-9;]*[a-zA-Z]', '', text)
+                text = self._ansi_re.sub('', text)
                 # Normalize line endings: \r\n -> \n first
                 text = text.replace('\r\n', '\n')
                 if not self.term_lines:
@@ -3899,8 +3930,13 @@ class Editor:
                 pass
             self.term_fd = None
         if self.term_pid and self.term_pid > 0:
+            import signal
             try:
-                os.waitpid(self.term_pid, os.WNOHANG)
+                os.kill(self.term_pid, signal.SIGHUP)
+            except OSError:
+                pass
+            try:
+                os.waitpid(self.term_pid, 0)
             except ChildProcessError:
                 pass
             self.term_pid = None
@@ -4065,7 +4101,7 @@ class Editor:
         bg = getattr(self, 'color_bg', curses.A_NORMAL)
         dim_attr = curses.A_DIM | bg
         border_attr = getattr(self, 'color_status', curses.A_REVERSE)
-        visible_h = height - 2  # rows for minimap content
+        visible_h = max(1, height - 2)  # rows for minimap content
         total = len(self.lines)
         # Each minimap row represents `ratio` source lines
         if total <= visible_h:
@@ -4309,6 +4345,8 @@ class Editor:
         self.current_buffer_idx = (self.current_buffer_idx + 1) % len(self.buffer_order)
         self.filepath = self.buffer_order[self.current_buffer_idx]
         self.lines = self.buffers[self.filepath][:]
+        self.cy = min(self.cy, max(0, len(self.lines) - 1))
+        self.cx = min(self.cx, max(0, len(self.lines[self.cy]) - 1)) if self.lines[self.cy] else 0
         self.message = f"Buffer: {self.filepath}"
 
     def prev_buffer(self):
@@ -4319,6 +4357,8 @@ class Editor:
         self.current_buffer_idx = (self.current_buffer_idx - 1) % len(self.buffer_order)
         self.filepath = self.buffer_order[self.current_buffer_idx]
         self.lines = self.buffers[self.filepath][:]
+        self.cy = min(self.cy, max(0, len(self.lines) - 1))
+        self.cx = min(self.cx, max(0, len(self.lines[self.cy]) - 1)) if self.lines[self.cy] else 0
         self.message = f"Buffer: {self.filepath}"
 
     def list_buffers(self):
