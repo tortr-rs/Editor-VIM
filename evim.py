@@ -20,6 +20,7 @@ class Editor:
         self.options = {
             "tabsize": 4,
             "number": False,
+            "relativenumber": False,
             "show_command": True,
             "theme": "classic_blue",
             "indent_guides": False,
@@ -736,8 +737,15 @@ class Editor:
         for idx, line in enumerate(self.lines[top: top + height - 2]):
             lineno = top + idx
             prefix = ""
-            if self.options.get("number"):
-                prefix = f"{lineno + 1:4} "
+            if self.options.get("number") or self.options.get("relativenumber"):
+                if self.options.get("relativenumber"):
+                    if lineno == self.cy:
+                        num = lineno + 1
+                    else:
+                        num = abs(lineno - self.cy)
+                else:
+                    num = lineno + 1
+                prefix = f"{num:4} "
             display_line = line.replace("\t", " " * self.options["tabsize"])
             cursor_col = None
             if lineno == self.cy:
@@ -773,7 +781,7 @@ class Editor:
                 display_cx += self.options["tabsize"]
             else:
                 display_cx += 1
-        curses.setsyx(self.cy - top, display_cx + (5 if self.options.get("number") else 0))
+        curses.setsyx(self.cy - top, display_cx + (5 if self.options.get("number") or self.options.get("relativenumber") else 0))
         curses.doupdate()
 
     def draw_overlay(self, stdscr):
@@ -1212,6 +1220,12 @@ class Editor:
         elif option == "nonumber":
             self.options["number"] = False
             self.message = "Line numbers disabled"
+        elif option == "relativenumber":
+            self.options["relativenumber"] = True
+            self.message = "Relative line numbers enabled"
+        elif option == "norelativenumber":
+            self.options["relativenumber"] = False
+            self.message = "Relative line numbers disabled"
         elif option == "indent_guides":
             self.options["indent_guides"] = True
             self.message = "Indent guides enabled"
