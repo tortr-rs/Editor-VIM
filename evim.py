@@ -1211,6 +1211,10 @@ class Editor:
             theme_name = command[6:].strip()
             self.set_theme(theme_name)
             return
+        if command.startswith("evimlang "):
+            evim_code = command[9:].strip()
+            self.run_evimlang(evim_code)
+            return
         self.message = f"Unknown command: {command}"
 
     def parse_set(self, option):
@@ -1408,7 +1412,13 @@ class Editor:
         self.cx = col
         self.set_cursor()
 
-    def set_theme(self, theme_name):
+    def run_evimlang(self, code):
+        """Execute evimlang code on the fly"""
+        try:
+            self.parse_evimlang(code)
+            self.message = "Evimlang executed"
+        except Exception as e:
+            self.message = f"Evimlang error: {e}"
         valid_themes = [
             "classic_blue", "neon_nights", "desert_storm", "sunny_meadow", "vampire_castle",
             "arctic_aurora", "forest_grove", "golden_wheat", "midnight_sky", "cloudy_day",
