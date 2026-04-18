@@ -16,6 +16,7 @@ import time
 import traceback
 from pathlib import Path
 
+
 OPTION_ALIASES = {
     "tabstop": "tabsize", "ts": "tabsize",
     "nu": "number", "numbers": "number",
@@ -44,6 +45,13 @@ class Editor:
             "cursorline": False,
             "mouse": True,
             "wrap": False,
+            "error_lens": True,
+            "autosave": False,
+            "autosave_delay": 5,
+            "tabline": True,
+            "bracket_highlight": True,
+            "word_highlight": False,
+            "statusline": True,
         }
         self.python_env = {"editor": self}
         self.start_hooks = []
@@ -141,6 +149,58 @@ class Editor:
         # Minimap
         self.minimap_visible = False
         self.minimap_width = 20
+        # Menu system
+        self.menu_visible = False
+        self.menu_cursor = 0
+        self._autosave_counter = 0
+        self._bracket_match_pos = None
+        self._color_depth = 8
+        self._word_hl_positions = []  # [(y, x_start, x_end), ...]
+        # Mouse state
+        self._last_click_time = 0
+        self._last_click_pos = (-1, -1)
+        self._mouse_dragging = False
+        self._triple_click_time = 0
+        # Kill ring (multi-clipboard)
+        self.kill_ring = []
+        self.kill_ring_max = 30
+        self.kill_ring_idx = 0
+        # Incremental search
+        self._isearch_active = False
+        self._isearch_matches = []
+        self._isearch_idx = 0
+        self._isearch_origin = (0, 0)
+        # Code folding
+        self.folds = {}
+        # Right-click context menu
+        self._ctx_menu_visible = False
+        self._ctx_menu_items = []
+        self._ctx_menu_x = 0
+        self._ctx_menu_y = 0
+        self._ctx_menu_cursor = 0
+        # Command palette
+        self._palette_visible = False
+        self._palette_query = ""
+        self._palette_items = []
+        self._palette_filtered = []
+        self._palette_cursor = 0
+        # Recent files
+        self.recent_files = []
+        self.recent_files_max = 25
+        self._recent_file_path = Path.home() / ".config" / "evim" / "recent_files.json"
+        # Project grep results
+        self._grep_results = []
+        self._grep_cursor = 0
+        self._grep_visible = False
+        # Symbol outline
+        self._outline_visible = False
+        self._outline_items = []
+        self._outline_cursor = 0
+        # Multi-cursor
+        self.cursors = []
+        # Surround pending
+        self._surround_pending = None
+        self._load_recent_files()
         self.read_file()
         if self.filepath:
             self.buffers[self.filepath] = self.lines[:]
@@ -355,6 +415,31 @@ class Editor:
         self.color_lineno = curses.color_pair(9)
         self.color_cmdline = curses.color_pair(10)
         self.color_bg = curses.color_pair(8)
+        # Detect terminal color capabilities
+        self._color_depth = curses.COLORS if hasattr(curses, 'COLORS') else 8
+        # Error lens colors (inline diagnostics)
+        curses.init_pair(11, RED, BLK)    # error
+        curses.init_pair(12, YEL, BLK)    # warning
+        curses.init_pair(13, CYN, BLK)    # info/hint
+        # Tab bar colors
+        curses.init_pair(14, WHT, BLU)    # active tab
+        curses.init_pair(15, WHT, BLK)    # inactive tab
+        # Menu colors
+        curses.init_pair(16, BLK, CYN)    # menu highlight
+        curses.init_pair(17, WHT, BLU)    # menu header
+        # Bracket match
+        curses.init_pair(18, GRN, BLK)    # matching bracket
+        # Word highlight
+        curses.init_pair(19, BLK, YEL)    # word under cursor hl
+        self.color_error_lens = curses.color_pair(11) | curses.A_BOLD
+        self.color_warn_lens = curses.color_pair(12)
+        self.color_info_lens = curses.color_pair(13)
+        self.color_tab_active = curses.color_pair(14) | curses.A_BOLD
+        self.color_tab_inactive = curses.color_pair(15)
+        self.color_menu_hl = curses.color_pair(16) | curses.A_BOLD
+        self.color_menu_header = curses.color_pair(17) | curses.A_BOLD
+        self.color_bracket_match = curses.color_pair(18) | curses.A_BOLD | curses.A_UNDERLINE
+        self.color_word_hl = curses.color_pair(19)
         self.colors_initialized = True
 
     def detect_syntax(self):
@@ -1162,8 +1247,19 @@ class Editor:
     def plugin_load_all(self):
         """Load plugins from all configured plugin directories."""
         total = 0
+        loaded_names = set()  # Track filenames to avoid loading duplicates
         for d in self.plugin_dirs:
-            total += self.plugin_load_dir(d)
+            dp = Path(d)
+            if not dp.is_dir():
+                continue
+            for f in sorted(dp.glob("*.py")):
+                if f.name.startswith("_"):
+                    continue
+                if f.name in loaded_names:
+                    continue  # Skip duplicate plugin files across directories
+                loaded_names.add(f.name)
+                if self.plugin_load_file(f):
+                    total += 1
         if total:
             self.message = f"Loaded {total} plugin(s)"
         return total
@@ -1368,6 +1464,36 @@ class Editor:
         while not self.should_exit:
             if self.mode == "overlay":
                 self.draw_overlay(stdscr)
+            elif self._palette_visible:
+                self.redraw(stdscr)
+                self.draw_palette(stdscr, *stdscr.getmaxyx())
+                curses.doupdate()
+                self.handle_palette_key(stdscr)
+                continue
+            elif self._grep_visible:
+                self.redraw(stdscr)
+                self.draw_grep_results(stdscr, *stdscr.getmaxyx())
+                curses.doupdate()
+                self.handle_grep_key(stdscr)
+                continue
+            elif self._outline_visible:
+                self.redraw(stdscr)
+                self.draw_outline(stdscr, *stdscr.getmaxyx())
+                curses.doupdate()
+                self.handle_outline_key(stdscr)
+                continue
+            elif self.menu_visible:
+                self.redraw(stdscr)
+                self.handle_menu_key(stdscr)
+                continue
+            elif self._ctx_menu_visible:
+                self.redraw(stdscr)
+                self._draw_context_menu(stdscr, *stdscr.getmaxyx())
+                curses.doupdate()
+                ch = stdscr.getch()
+                if ch >= 0:
+                    self._handle_context_menu_key(ch)
+                continue
             else:
                 self.redraw(stdscr)
             self.handle_key(stdscr)
@@ -1380,7 +1506,22 @@ class Editor:
         bg = getattr(self, 'color_bg', curses.A_NORMAL)
         stdscr.bkgd(' ', bg)
         stdscr.erase()
-        # Draw side panels and compute editor area
+
+        # ── Menu overlay ──
+        if self.menu_visible:
+            self.draw_menu(stdscr, height, width)
+            curses.doupdate()
+            return
+
+        # ── Auto-save tick ──
+        if self.options.get("autosave") and self.dirty and self.filepath:
+            self._autosave_counter += 1
+            delay = self.options.get("autosave_delay", 5) * 10  # ~100ms per tick
+            if self._autosave_counter >= delay:
+                self._autosave_counter = 0
+                self.write_file()
+
+        # ── Draw side panels and compute editor area ──
         editor_left = 0
         editor_right = width
         if self.explorer_visible:
@@ -1395,19 +1536,72 @@ class Editor:
             editor_w = width
             editor_left = 0
             editor_right = width
-        top = max(0, self.cy - height + 4)
-        num_file_lines = len(self.lines[top: top + height - 2])
-        has_gutter = bool(self.git_diff_lines)
+
+        # ── Tab/buffer bar ──
+        tab_h = 0
+        if self.options.get("tabline") and len(self.buffer_order) > 0:
+            tab_h = 1
+            self._draw_tabline(stdscr, editor_left, editor_w, width)
+
+        # ── Bracket match finding ──
+        self._bracket_match_pos = None
+        if self.options.get("bracket_highlight"):
+            self._find_bracket_match()
+
+        # ── Word under cursor positions ──
+        self._word_hl_positions = []
+        if self.options.get("word_highlight"):
+            self._find_word_highlights()
+
+        top = max(0, self.cy - height + 4 + tab_h)
+        content_rows = height - 2 - tab_h
+
+        # ── Build visible line list (accounting for folds) ──
+        visible_lines = []  # [(actual_lineno, line_text), ...]
+        i = 0
+        while i < len(self.lines):
+            visible_lines.append((i, self.lines[i]))
+            if i in self.folds:
+                i = self.folds[i] + 1
+            else:
+                i += 1
+        # Find top in visible lines
+        vis_top = 0
+        for vi, (lineno, _) in enumerate(visible_lines):
+            if lineno >= self.cy:
+                vis_top = max(0, vi - height + 4 + tab_h)
+                break
+        display_lines = visible_lines[vis_top:vis_top + content_rows]
+        num_file_lines = len(display_lines)
+        has_gutter = bool(self.git_diff_lines) or (self.lsp_enabled and self.lsp_diagnostics)
         gutter_w = 2 if has_gutter else 0
-        for idx, line in enumerate(self.lines[top: top + height - 2]):
-            lineno = top + idx
+
+        # ── Build diagnostic lookup for error lens ──
+        diag_by_line = {}
+        if self.lsp_enabled and self.lsp_diagnostics:
+            for dline, dcol, sev, dmsg in self.lsp_diagnostics:
+                if dline not in diag_by_line or sev < diag_by_line[dline][0]:
+                    diag_by_line[dline] = (sev, dmsg)
+
+        for idx, (lineno, line) in enumerate(display_lines):
+            row = idx + tab_h
             x_off = editor_left
-            # Git gutter
+            # Git gutter + LSP diagnostic gutter
             if has_gutter:
                 diff_type = self.git_diff_lines.get(lineno)
+                diag_info = diag_by_line.get(lineno)
                 gutter_ch = " "
                 gutter_attr = bg
-                if diff_type == 'added':
+                if diag_info:
+                    sev = diag_info[0]
+                    gutter_ch = "●"
+                    if sev == 1:
+                        gutter_attr = getattr(self, 'color_error_lens', curses.color_pair(2) | curses.A_BOLD)
+                    elif sev == 2:
+                        gutter_attr = getattr(self, 'color_warn_lens', curses.color_pair(8) | curses.A_BOLD)
+                    else:
+                        gutter_attr = getattr(self, 'color_info_lens', curses.color_pair(5) | curses.A_BOLD)
+                elif diff_type == 'added':
                     gutter_ch = "+"
                     gutter_attr = self.color_keyword
                 elif diff_type == 'modified':
@@ -1417,7 +1611,7 @@ class Editor:
                     gutter_ch = "-"
                     gutter_attr = self.color_preprocessor
                 try:
-                    stdscr.addstr(idx, x_off, gutter_ch + " ", gutter_attr)
+                    stdscr.addstr(row, x_off, gutter_ch + " ", gutter_attr)
                 except curses.error:
                     pass
             prefix = ""
@@ -1450,21 +1644,42 @@ class Editor:
             full_prefix = " " * gutter_w + prefix if gutter_w else prefix
             # Truncate line to editor area width
             avail_w = editor_w
-            drawn = self.highlight_line(stdscr, idx, display_line, full_prefix, avail_w, cursor_col, x_off)
+            drawn = self.highlight_line(stdscr, row, display_line, full_prefix, avail_w, cursor_col, x_off)
+
+            # ── Error Lens: inline diagnostic message ──
+            if self.options.get("error_lens") and lineno in diag_by_line:
+                sev, dmsg = diag_by_line[lineno]
+                lens_attr = getattr(self, 'color_error_lens', curses.A_BOLD)
+                if sev == 2:
+                    lens_attr = getattr(self, 'color_warn_lens', curses.A_NORMAL)
+                elif sev >= 3:
+                    lens_attr = getattr(self, 'color_info_lens', curses.A_NORMAL)
+                # Draw inline after the line content
+                gap = 2
+                avail = x_off + editor_w - 1 - drawn - gap
+                if avail > 8:
+                    severity_label = {1: "ERR", 2: "WARN", 3: "INFO", 4: "HINT"}.get(sev, "?")
+                    lens_text = f"  {severity_label}: {dmsg}"
+                    lens_text = lens_text[:avail]
+                    try:
+                        stdscr.addstr(row, drawn + gap, lens_text, lens_attr | curses.A_DIM)
+                    except curses.error:
+                        pass
+
             # Cursorline highlight
             if self.options.get("cursorline") and lineno == self.cy:
                 if drawn < x_off + editor_w - 1:
                     try:
-                        stdscr.addstr(idx, drawn, " " * (x_off + editor_w - 1 - drawn), curses.A_UNDERLINE | bg)
+                        stdscr.addstr(row, drawn, " " * (x_off + editor_w - 1 - drawn), curses.A_UNDERLINE | bg)
                     except curses.error:
                         pass
                 try:
-                    stdscr.chgat(idx, x_off + gutter_w, editor_w - 1 - gutter_w, curses.A_UNDERLINE | bg)
+                    stdscr.chgat(row, x_off + gutter_w, editor_w - 1 - gutter_w, curses.A_UNDERLINE | bg)
                 except curses.error:
                     pass
             elif drawn < x_off + editor_w - 1:
                 try:
-                    stdscr.addstr(idx, drawn, " " * (x_off + editor_w - 1 - drawn), bg)
+                    stdscr.addstr(row, drawn, " " * (x_off + editor_w - 1 - drawn), bg)
                 except curses.error:
                     pass
             # Draw indent guides at each tab stop within the leading whitespace
@@ -1477,12 +1692,70 @@ class Editor:
                         gx = x_off + prefix_len + col
                         if x_off <= gx < x_off + editor_w - 1:
                             try:
-                                stdscr.addstr(idx, gx, "│", curses.A_DIM | bg)
+                                stdscr.addstr(row, gx, "│", curses.A_DIM | bg)
                             except curses.error:
                                 pass
+
+            # ── Bracket match highlight ──
+            if self._bracket_match_pos and self._bracket_match_pos[0] == lineno:
+                bm_col = self._bracket_match_pos[1]
+                prefix_len = len(full_prefix)
+                bm_display_col = bm_col - scroll_left
+                if bm_display_col >= 0:
+                    bm_x = x_off + prefix_len + bm_display_col
+                    if x_off <= bm_x < x_off + editor_w - 1:
+                        bracket_attr = getattr(self, 'color_bracket_match', curses.A_BOLD | curses.A_UNDERLINE)
+                        try:
+                            stdscr.chgat(row, bm_x, 1, bracket_attr)
+                        except curses.error:
+                            pass
+
+            # ── Word highlight ──
+            if self._word_hl_positions:
+                prefix_len = len(full_prefix)
+                for wy, wx_start, wx_end in self._word_hl_positions:
+                    if wy == lineno and (wy != self.cy or wx_start != self.cx):
+                        whl_start = wx_start - scroll_left + prefix_len + x_off
+                        whl_len = wx_end - wx_start
+                        if whl_start >= x_off and whl_start + whl_len < x_off + editor_w:
+                            word_attr = getattr(self, 'color_word_hl', curses.A_UNDERLINE)
+                            try:
+                                stdscr.chgat(row, whl_start, whl_len, word_attr)
+                            except curses.error:
+                                pass
+
+            # ── Incremental search match highlights ──
+            if self._isearch_active and self._isearch_matches:
+                prefix_len = len(full_prefix)
+                for mline, mcol, mlen in self._isearch_matches:
+                    if mline == lineno:
+                        hl_start = mcol - scroll_left + prefix_len + x_off
+                        if hl_start >= x_off and hl_start + mlen < x_off + editor_w:
+                            is_current = (self._isearch_idx < len(self._isearch_matches) and
+                                          self._isearch_matches[self._isearch_idx] == (mline, mcol, mlen))
+                            if is_current:
+                                search_attr = curses.A_REVERSE | curses.A_BOLD
+                            else:
+                                search_attr = curses.A_REVERSE
+                            try:
+                                stdscr.chgat(row, hl_start, mlen, search_attr)
+                            except curses.error:
+                                pass
+
+            # ── Fold indicator ──
+            if lineno in self.folds:
+                fold_end = self.folds[lineno]
+                fold_text = f" ··· {fold_end - lineno} lines folded ···"
+                fold_col = len(full_prefix) + len(display_line) + x_off
+                if fold_col < x_off + editor_w - len(fold_text):
+                    try:
+                        stdscr.addstr(row, fold_col, fold_text[:editor_w], curses.A_DIM | curses.A_ITALIC)
+                    except curses.error:
+                        pass
+
         # Fill empty rows below file content with tilde markers
         ln_attr = getattr(self, 'color_lineno', bg)
-        for idx in range(num_file_lines, height - 2):
+        for idx in range(num_file_lines + tab_h, height - 2):
             try:
                 stdscr.addstr(idx, editor_left, "~".ljust(editor_w - 1), ln_attr)
             except curses.error:
@@ -1491,9 +1764,10 @@ class Editor:
         dirty_marker = "[+]" if self.dirty else ""
         ft = self.syntax_language or "plain"
         linecol = f"Ln {self.cy + 1}/{len(self.lines)}, Col {self.cx + 1}"
+        color_info = f"{self._color_depth}c" if self._color_depth != 8 else ""
         left_status = f" {self.mode.upper()} | {self.filepath or '[no file]'} {dirty_marker}"
         run_btn = " \u25b6 Run " if self.filepath else ""
-        right_status = f"{ft} | {linecol} "
+        right_status = f"{ft} {color_info}| {linecol} "
         mid = self.message
         gap = width - 1 - len(left_status) - len(run_btn) - len(right_status)
         if gap > len(mid) + 2:
@@ -1549,22 +1823,6 @@ class Editor:
         # Draw terminal panel if visible
         if self.term_visible:
             self.draw_terminal_panel(stdscr)
-        # Draw LSP diagnostic markers in gutter
-        if self.lsp_enabled and self.lsp_diagnostics:
-            for dline, dcol, sev, dmsg in self.lsp_diagnostics:
-                row = dline - top
-                if 0 <= row < height - 2:
-                    marker = "●"
-                    if sev == 1:
-                        attr = curses.color_pair(2) | curses.A_BOLD
-                    elif sev == 2:
-                        attr = curses.color_pair(8) | curses.A_BOLD
-                    else:
-                        attr = curses.color_pair(5) | curses.A_BOLD
-                    try:
-                        stdscr.addstr(row, editor_left, marker, attr)
-                    except curses.error:
-                        pass
         # Draw LSP completion popup
         if self.lsp_completion_active:
             self.draw_lsp_completion_popup(stdscr, height, width)
@@ -1578,8 +1836,31 @@ class Editor:
                     stdscr.addstr(height - 2, lsp_col, lsp_ind, lsp_attr)
                 except curses.error:
                     pass
+        # Color depth indicator
+        if self._color_depth > 8:
+            depth_ind = f" {self._color_depth}c"
+            depth_col = width - len(depth_ind) - (5 if self.lsp_enabled else 1)
+            if depth_col > 0:
+                try:
+                    stdscr.addstr(height - 2, depth_col, depth_ind, curses.A_DIM | getattr(self, 'color_status', curses.A_REVERSE))
+                except curses.error:
+                    pass
+        # F10 hint
+        f10_hint = " F10:Menu"
+        f10_col = len(left_status) + len(run_btn)
+        if f10_col + len(f10_hint) < width // 2:
+            try:
+                stdscr.addstr(height - 2, f10_col, f10_hint, curses.A_DIM | getattr(self, 'color_status', curses.A_REVERSE))
+            except curses.error:
+                pass
         if self.mode != "terminal" and self.mode != "explorer":
-            curses.setsyx(self.cy - top, display_cx - scroll_left + prefix_w + editor_left)
+            # Find cursor row in visible display
+            cursor_display_row = 0
+            for di, (ln, _) in enumerate(display_lines):
+                if ln == self.cy:
+                    cursor_display_row = di
+                    break
+            curses.setsyx(cursor_display_row + tab_h, display_cx - scroll_left + prefix_w + editor_left)
         curses.doupdate()
 
     def draw_overlay(self, stdscr):
@@ -1688,6 +1969,52 @@ class Editor:
                 "  K               hover info",
                 "  Tab (insert)    LSP completion",
                 "",
+                "── IDE Features ──",
+                "  F10 / Alt+x     settings menu",
+                "  F2              save config to evimrc.py",
+                "  Alt+Up / Alt+k  move line up",
+                "  Alt+Dn / Alt+j  move line down",
+                "  Alt+d           duplicate line",
+                "  Ctrl+x          command palette (M-x)",
+                "  Ctrl+y          kill ring paste",
+                "  Right-click     context menu",
+                "",
+                "── Folding ──",
+                "  za              toggle fold at cursor",
+                "  zo / zc         open / close fold",
+                "  zM / zR         fold all / unfold all",
+                "",
+                "── Surround ──",
+                "  cs<old><new>    change surround pair",
+                "  ds<char>        delete surround pair",
+                "  S<char>         surround selection (visual)",
+                "",
+                "── Mouse ──",
+                "  Click           position cursor",
+                "  Double-click    select word",
+                "  Triple-click    select line",
+                "  Drag            visual selection",
+                "  Right-click     context menu",
+                "  Scroll wheel    scroll up/down",
+                "  Click tab bar   switch buffer",
+                "  Click minimap   jump to position",
+                "  Click mode      toggle insert/normal",
+                "",
+                "── IDE Commands ──",
+                "  :menu           open settings menu",
+                "  :palette        command palette",
+                "  :grep <pat>     project-wide search",
+                "  :outline        symbol outline",
+                "  :recent         recent files",
+                "  :killring       show kill ring",
+                "  :fold / :za     toggle fold",
+                "  :foldall / :zM  fold all",
+                "  :unfoldall      unfold all",
+                "  :savecfg        save config to evimrc.py",
+                "  :errorlens      toggle error lens",
+                "  :tabline        toggle tab bar",
+                "  :autosave       toggle auto save",
+                "",
                 "Press any key to return...",
             ]
         box_top = max(0, (height - len(lines)) // 2 - 1)
@@ -1734,6 +2061,46 @@ class Editor:
                 prefix_w = (2 if self.git_diff_lines else 0) + (5 if has_nums else 0)
                 scroll_left = self.scroll_left if not self.options.get("wrap") else 0
                 now = time.time()
+                tab_h = 1 if self.options.get("tabline") else 0
+                # ── Right-click context menu ──
+                if bstate & (curses.BUTTON3_PRESSED | curses.BUTTON3_CLICKED):
+                    self._show_context_menu(stdscr, mx, my)
+                    return
+                # ── Click on tab bar ──
+                if tab_h and my == 0 and (bstate & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED)):
+                    editor_left = min(self.explorer_width, width // 3) if self.explorer_visible else 0
+                    x = editor_left
+                    for i, buf_path in enumerate(self.buffer_order):
+                        name = os.path.basename(buf_path) if buf_path != "[No Name]" else "[No Name]"
+                        if buf_path == self.filepath and self.dirty:
+                            name += "●"
+                        tab_len = len(f" {name} ") + 1  # +1 for separator
+                        if x <= mx < x + tab_len:
+                            # Switch to this buffer
+                            if i != self.current_buffer_idx:
+                                if self.filepath and self.filepath in self.buffers:
+                                    self.buffers[self.filepath] = self.lines[:]
+                                self.current_buffer_idx = i
+                                self.filepath = self.buffer_order[i]
+                                self.lines = self.buffers[self.filepath][:]
+                                self.cy = min(self.cy, max(0, len(self.lines) - 1))
+                                self.cx = 0
+                                self.detect_syntax()
+                                self.message = f"Buffer: {os.path.basename(self.filepath)}"
+                            return
+                        x += tab_len
+                    return
+                # ── Click on minimap ──
+                if self.minimap_visible:
+                    mm_x = width - self.minimap_width
+                    if mx >= mm_x and (bstate & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED)):
+                        # Jump to approximate position
+                        ratio = my / max(1, height - 3)
+                        target = int(ratio * len(self.lines))
+                        self.cy = max(0, min(target, len(self.lines) - 1))
+                        self.cx = 0
+                        self.message = f"Jumped to line {self.cy + 1}"
+                        return
                 # Check if click is inside the file explorer
                 if self.explorer_visible:
                     ew = min(self.explorer_width, width // 3)
@@ -1782,14 +2149,40 @@ class Editor:
                             self.term_scroll = max(0, self.term_scroll - 3)
                             return
                         return
-                # Click on Run button in status bar
+                # Click on Run button / status bar buttons
                 if my == height - 2 and self.filepath:
-                    run_label = " \u25b6 Run "
-                    run_col = len(f" {self.mode.upper()} | {self.filepath or '[no file]'} {'[+]' if self.dirty else ''}")
                     if bstate & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED):
+                        run_label = " ▶ Run "
+                        run_col = len(f" {self.mode.upper()} | {self.filepath or '[no file]'} {'[+]' if self.dirty else ''}")
+                        f10_col = run_col + len(run_label)
                         if run_col <= mx < run_col + len(run_label):
                             self.run_file()
                             return
+                        # Click on F10:Menu hint
+                        f10_hint = " F10:Menu"
+                        if f10_col <= mx < f10_col + len(f10_hint):
+                            self.menu_visible = True
+                            self.menu_cursor = 0
+                            return
+                        # Click on mode indicator to toggle insert/normal
+                        mode_len = len(f" {self.mode.upper()} ")
+                        if mx < mode_len:
+                            if self.mode == "normal":
+                                self.mode = "insert"
+                                self.message = "-- INSERT --"
+                                self._set_cursor_shape(beam=True)
+                            elif self.mode == "insert":
+                                self.mode = "normal"
+                                self.message = "EVim - normal mode"
+                                self._set_cursor_shape(beam=False)
+                            return
+                        # Click on LSP indicator
+                        if self.lsp_enabled:
+                            lsp_col = width - 5
+                            if lsp_col <= mx:
+                                self.message = f"LSP: {self.lsp_server_cmd[0] if self.lsp_server_cmd else 'none'} | Diagnostics: {len(self.lsp_diagnostics)}"
+                                return
+                    return
                 # Scroll wheel (works in any mode in the editor area)
                 if bstate & (curses.BUTTON4_PRESSED if hasattr(curses, 'BUTTON4_PRESSED') else 0):
                     self.scroll_half_up(height)
@@ -1804,11 +2197,22 @@ class Editor:
                     target_col = max(0, mx - prefix_w - editor_left_off + scroll_left)
                     if 0 <= target_line < len(self.lines):
                         target_col = min(target_col, len(self.lines[target_line]))
-                        # Double-click: select word under cursor
+                        # Double/Triple-click: word/line selection
                         if bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED):
                             same_pos = (self._last_click_pos == (target_line, target_col))
                             if same_pos and (now - self._last_click_time) < 0.4:
+                                if (now - self._triple_click_time) < 0.8 and self.selection:
+                                    # Triple click — select entire line
+                                    self.selection = (target_line, 0)
+                                    self.cy = target_line
+                                    self.cx = len(self.lines[target_line])
+                                    self.message = "Line selected"
+                                    self._last_click_time = 0
+                                    self._last_click_pos = (-1, -1)
+                                    self._triple_click_time = 0
+                                    return
                                 # Double click — select word
+                                self._triple_click_time = now
                                 line = self.lines[target_line]
                                 wstart = target_col
                                 wend = target_col
@@ -1879,6 +2283,15 @@ class Editor:
         # F5 - run file
         if ch == curses.KEY_F5:
             self.run_file()
+            return
+        # F10 - settings menu
+        if ch == curses.KEY_F10:
+            self.menu_visible = True
+            self.menu_cursor = 0
+            return
+        # F2 - save config
+        if ch == curses.KEY_F2 and not self.bindings.get(("normal", "<F2>")):
+            self.save_config()
             return
         # Explorer mode input handling
         if self.mode == "explorer":
@@ -2008,20 +2421,43 @@ class Editor:
             return
         if self.mode == "command":
             if ch in (curses.KEY_ENTER, 10, 13):
+                self._isearch_active = False
+                self._isearch_matches = []
                 self.run_command()
                 self.command = ""
                 self.mode = "normal"
                 return
             if ch in (curses.KEY_BACKSPACE, 127, curses.ascii.DEL):
                 self.command = self.command[:-1]
+                # Update incremental search
+                if self.command.startswith("/") or self.command.startswith("?"):
+                    self._isearch_active = True
+                    self.isearch_update(self.command[1:])
                 return
             if ch == 27:
+                self._isearch_active = False
+                self._isearch_matches = []
+                # Restore cursor to pre-search position
+                if hasattr(self, '_isearch_origin'):
+                    self.cy, self.cx = self._isearch_origin
                 self.mode = "normal"
                 self.command = ""
                 self.message = "EVim - normal mode"
                 return
+            # Ctrl+n / Ctrl+p for next/prev match during search
+            if ch == 14 and self._isearch_active:  # Ctrl+n
+                self.isearch_next()
+                return
+            if ch == 16 and self._isearch_active:  # Ctrl+p
+                self.isearch_prev()
+                return
             if 0 <= ch < 256:
                 self.command += chr(ch)
+                # Incremental search as you type
+                if self.command.startswith("/") or self.command.startswith("?"):
+                    self._isearch_active = True
+                    self._isearch_origin = self._isearch_origin if hasattr(self, '_isearch_origin') and self._isearch_active else (self.cy, self.cx)
+                    self.isearch_update(self.command[1:])
             return
         key = self.key_name(ch)
         if self.pending_normal:
@@ -2044,6 +2480,14 @@ class Editor:
                 self.snapshot()
                 self.change_word()
                 return
+            if combo == "cs":
+                self._surround_pending = "cs"
+                self.message = "cs: enter old char..."
+                return
+            if combo == "ds":
+                self._surround_pending = "ds"
+                self.message = "ds: enter char to delete..."
+                return
             if combo == "vv":
                 self.toggle_selection()
                 return
@@ -2057,6 +2501,9 @@ class Editor:
             return
         if key == "d":
             self.pending_normal = "d"
+            return
+        if key == "c":
+            self.pending_normal = "c"
             return
         if key == "y":
             self.pending_normal = "y"
@@ -2303,6 +2750,61 @@ class Editor:
             self.toggle_case()
             return
 
+        # z prefix — folding commands
+        if key == "z":
+            self.pending_normal = "z"
+            return
+        if self.pending_normal == "z":
+            self.pending_normal = ""
+            if key == "a":
+                self.fold_toggle()
+            elif key == "o":
+                self.fold_open()
+            elif key == "c":
+                self.fold_close()
+            elif key == "M":
+                self.fold_all()
+            elif key == "R":
+                self.unfold_all()
+            else:
+                self.message = f"Unknown fold command: z{key}"
+            return
+
+        # Surround pending handlers (set by cs/ds combos above)
+        if self._surround_pending == "cs":
+            self._surround_pending = ("cs", key)
+            self.message = f"cs{key}: enter new char..."
+            return
+        if isinstance(self._surround_pending, tuple) and self._surround_pending[0] == "cs":
+            old_char = self._surround_pending[1]
+            self.surround_change(old_char, key)
+            self._surround_pending = None
+            return
+        if self._surround_pending == "ds":
+            self.surround_delete(key)
+            self._surround_pending = None
+            return
+
+        # S in visual mode — surround selection
+        if key == "S" and self.selection:
+            self._surround_pending = "ys"
+            self.message = "S: enter surround char..."
+            return
+        if self._surround_pending == "ys":
+            self.surround_add(key)
+            self._surround_pending = None
+            return
+
+        # Ctrl+x — command palette (M-x style)
+        if ch == 24:  # Ctrl+x
+            self.palette_open()
+            return
+
+        # Ctrl+y — kill ring paste
+        if ch == 25:  # Ctrl+y
+            self.kill_ring_yank()
+            return
+
         # Ctrl+s - quick save
         if ch == 19:  # Ctrl+s
             self.quick_save()
@@ -2327,13 +2829,50 @@ class Editor:
             self.message = f'"{fname}"{mod} {total} lines --{pct}%-- Ln {self.cy + 1}, Col {self.cx + 1}'
             return
 
+        # Alt key sequences (ESC + key)
+        if ch == 27 and self.mode == "normal":
+            stdscr.timeout(50)  # Brief wait for Alt sequence
+            next_ch = stdscr.getch()
+            stdscr.timeout(100)  # Restore timeout
+            if next_ch == curses.KEY_UP or next_ch == ord('k'):
+                self.snapshot()
+                self.move_line_up()
+                return
+            elif next_ch == curses.KEY_DOWN or next_ch == ord('j'):
+                self.snapshot()
+                self.move_line_down()
+                return
+            elif next_ch == ord('d') or next_ch == ord('D'):
+                self.snapshot()
+                self.duplicate_line()
+                return
+            elif next_ch == ord('x') or next_ch == ord('X'):
+                # Alt+x - command palette (Emacs M-x style)
+                self.palette_open()
+                return
+            elif next_ch == ord('y') or next_ch == ord('Y'):
+                # Alt+y - kill ring rotate
+                self.kill_ring_rotate()
+                return
+            elif next_ch == ord('o') or next_ch == ord('O'):
+                # Alt+o - symbol outline
+                self._build_outline()
+                return
+            elif next_ch == -1:
+                # Just ESC, no follow-up - do nothing in normal mode
+                return
+            # Unknown Alt combo - ignore
+            return
+
         # / and ? for search
         if key == "/":
+            self._isearch_origin = (self.cy, self.cx)
             self.mode = "command"
             self.command = "/"
             self.pending_normal = ""
             return
         if key == "?":
+            self._isearch_origin = (self.cy, self.cx)
             self.mode = "command"
             self.command = "?"
             self.pending_normal = ""
@@ -2826,6 +3365,105 @@ class Editor:
                 self.message = "Closed other buffers"
             return
 
+        # ── Settings menu ──
+        if cmd in ("menu", "settings"):
+            self.menu_visible = True
+            self.menu_cursor = 0
+            return
+
+        # ── Save config ──
+        if cmd in ("savecfg", "saveconfig", "cfgsave"):
+            self.save_config()
+            return
+
+        # ── Error lens toggle ──
+        if cmd == "errorlens":
+            self.options["error_lens"] = not self.options.get("error_lens", True)
+            state = "ON" if self.options["error_lens"] else "OFF"
+            self.message = f"Error Lens: {state}"
+            return
+
+        # ── Move line ──
+        if cmd == "moveup":
+            self.snapshot()
+            self.move_line_up()
+            return
+        if cmd == "movedown":
+            self.snapshot()
+            self.move_line_down()
+            return
+
+        # ── Duplicate line ──
+        if cmd in ("dup", "duplicate"):
+            self.snapshot()
+            self.duplicate_line()
+            return
+
+        # ── Toggle features ──
+        if cmd == "tabline":
+            self.options["tabline"] = not self.options.get("tabline", True)
+            state = "ON" if self.options["tabline"] else "OFF"
+            self.message = f"Tab line: {state}"
+            return
+        if cmd == "brackethl":
+            self.options["bracket_highlight"] = not self.options.get("bracket_highlight", True)
+            state = "ON" if self.options["bracket_highlight"] else "OFF"
+            self.message = f"Bracket highlight: {state}"
+            return
+        if cmd == "wordhl":
+            self.options["word_highlight"] = not self.options.get("word_highlight", False)
+            state = "ON" if self.options["word_highlight"] else "OFF"
+            self.message = f"Word highlight: {state}"
+            return
+        if cmd == "autosave":
+            self.options["autosave"] = not self.options.get("autosave", False)
+            state = "ON" if self.options["autosave"] else "OFF"
+            self.message = f"Auto save: {state}"
+            return
+
+        # ── Folding ──
+        if cmd in ("fold", "za"):
+            self.fold_toggle()
+            return
+        if cmd in ("foldall", "zM"):
+            self.fold_all()
+            return
+        if cmd in ("unfoldall", "zR"):
+            self.unfold_all()
+            return
+
+        # ── Command palette ──
+        if cmd in ("palette", "commands"):
+            self.palette_open()
+            return
+
+        # ── Grep ──
+        if cmd in ("grep", "rg"):
+            if rest:
+                self.project_grep(rest)
+            else:
+                self.message = "Usage: :grep <pattern>"
+            return
+
+        # ── Symbol outline ──
+        if cmd in ("outline", "symbols"):
+            self._build_outline()
+            return
+
+        # ── Recent files ──
+        if cmd in ("recent", "oldfiles"):
+            self._show_recent_files()
+            return
+
+        # ── Kill ring ──
+        if cmd == "killring":
+            if self.kill_ring:
+                entries = [f"[{i+1}] {t[:40]}" for i, t in enumerate(self.kill_ring[:10])]
+                self.message = " | ".join(entries)
+            else:
+                self.message = "Kill ring empty"
+            return
+
         self.message = f"Unknown command: {cmd}"
 
     def _ex_set(self, rest):
@@ -2933,6 +3571,8 @@ class Editor:
     def delete_line(self):
         if not self.lines:
             return
+        killed = self.lines[self.cy]
+        self.kill_ring_push(killed)
         del self.lines[self.cy]
         if not self.lines:
             self.lines = [""]
@@ -3788,6 +4428,1284 @@ class Editor:
             time.sleep(0.02)
         self.message = "LSP: references request timed out"
 
+    # ── Tab/Buffer Bar ─────────────────────────────────────────────
+
+    def _draw_tabline(self, stdscr, editor_left, editor_w, width):
+        """Draw a tab/buffer bar at the top of the editor."""
+        tab_attr_active = getattr(self, 'color_tab_active', curses.A_REVERSE | curses.A_BOLD)
+        tab_attr_inactive = getattr(self, 'color_tab_inactive', curses.A_DIM)
+        bg = getattr(self, 'color_bg', curses.A_NORMAL)
+        x = editor_left
+        max_x = width - 1
+        # Fill the tab bar row with background
+        try:
+            stdscr.addstr(0, editor_left, " " * min(editor_w, max_x - editor_left), bg)
+        except curses.error:
+            pass
+        for i, buf_path in enumerate(self.buffer_order):
+            if x >= max_x:
+                break
+            name = os.path.basename(buf_path) if buf_path != "[No Name]" else "[No Name]"
+            is_active = (i == self.current_buffer_idx)
+            # Show modified marker
+            if buf_path == self.filepath and self.dirty:
+                name += "●"
+            label = f" {name} "
+            attr = tab_attr_active if is_active else tab_attr_inactive
+            tab_len = len(label)
+            if x + tab_len > max_x:
+                label = label[:max_x - x]
+            try:
+                stdscr.addstr(0, x, label, attr)
+            except curses.error:
+                pass
+            x += tab_len
+            # Separator
+            if x < max_x:
+                try:
+                    stdscr.addstr(0, x, "│", curses.A_DIM | bg)
+                except curses.error:
+                    pass
+                x += 1
+
+    # ── Bracket Match Finding ──────────────────────────────────────
+
+    def _find_bracket_match(self):
+        """Find the matching bracket for the character under cursor."""
+        if self.cy >= len(self.lines):
+            return
+        line = self.lines[self.cy]
+        if self.cx >= len(line):
+            return
+        ch = line[self.cx]
+        pairs = {'(': ')', ')': '(', '[': ']', ']': '[', '{': '}', '}': '{'}
+        if ch not in pairs:
+            return
+        target = pairs[ch]
+        forward = ch in ('(', '[', '{')
+        depth = 0
+        if forward:
+            for row in range(self.cy, min(self.cy + 200, len(self.lines))):
+                start = self.cx + 1 if row == self.cy else 0
+                for col in range(start, len(self.lines[row])):
+                    c = self.lines[row][col]
+                    if c == ch:
+                        depth += 1
+                    elif c == target:
+                        if depth == 0:
+                            self._bracket_match_pos = (row, col)
+                            return
+                        depth -= 1
+        else:
+            for row in range(self.cy, max(self.cy - 200, -1), -1):
+                end = self.cx - 1 if row == self.cy else len(self.lines[row]) - 1
+                for col in range(end, -1, -1):
+                    c = self.lines[row][col]
+                    if c == ch:
+                        depth += 1
+                    elif c == target:
+                        if depth == 0:
+                            self._bracket_match_pos = (row, col)
+                            return
+                        depth -= 1
+
+    # ── Word Under Cursor Highlighting ─────────────────────────────
+
+    def _find_word_highlights(self):
+        """Find all occurrences of the word under cursor."""
+        self._word_hl_positions = []
+        if self.cy >= len(self.lines):
+            return
+        line = self.lines[self.cy]
+        if self.cx >= len(line):
+            return
+        ch = line[self.cx] if self.cx < len(line) else ''
+        if not (ch.isalnum() or ch == '_'):
+            return
+        # Extract word under cursor
+        start = self.cx
+        while start > 0 and (line[start - 1].isalnum() or line[start - 1] == '_'):
+            start -= 1
+        end = self.cx
+        while end < len(line) and (line[end].isalnum() or line[end] == '_'):
+            end += 1
+        word = line[start:end]
+        if len(word) < 2:
+            return
+        # Find all occurrences in visible lines (limit to ~100 lines for perf)
+        vis_start = max(0, self.cy - 50)
+        vis_end = min(len(self.lines), self.cy + 50)
+        for row in range(vis_start, vis_end):
+            ln = self.lines[row]
+            idx = 0
+            while True:
+                pos = ln.find(word, idx)
+                if pos < 0:
+                    break
+                # Check word boundary
+                before_ok = (pos == 0 or not (ln[pos - 1].isalnum() or ln[pos - 1] == '_'))
+                after_ok = (pos + len(word) >= len(ln) or not (ln[pos + len(word)].isalnum() or ln[pos + len(word)] == '_'))
+                if before_ok and after_ok:
+                    self._word_hl_positions.append((row, pos, pos + len(word)))
+                idx = pos + 1
+
+    # ── Move Line Up/Down ──────────────────────────────────────────
+
+    def move_line_up(self):
+        """Move the current line up one position (Alt+Up / Alt+k)."""
+        if self.cy <= 0:
+            return
+        self.lines[self.cy], self.lines[self.cy - 1] = self.lines[self.cy - 1], self.lines[self.cy]
+        self.cy -= 1
+        self.mark_dirty()
+        self.message = "Line moved up"
+
+    def move_line_down(self):
+        """Move the current line down one position (Alt+Down / Alt+j)."""
+        if self.cy >= len(self.lines) - 1:
+            return
+        self.lines[self.cy], self.lines[self.cy + 1] = self.lines[self.cy + 1], self.lines[self.cy]
+        self.cy += 1
+        self.mark_dirty()
+        self.message = "Line moved down"
+
+    # ── Duplicate Line ─────────────────────────────────────────────
+
+    def duplicate_line(self):
+        """Duplicate the current line below (Alt+d)."""
+        line = self.lines[self.cy]
+        self.lines.insert(self.cy + 1, line)
+        self.cy += 1
+        self.mark_dirty()
+        self.message = "Line duplicated"
+
+    # ── Emacs-Style Settings Menu ──────────────────────────────────
+
+    def _get_menu_items(self):
+        """Build the list of menu items for the settings panel."""
+        themes = [
+            "classic_blue", "neon_nights", "desert_storm", "sunny_meadow",
+            "vampire_castle", "arctic_aurora", "forest_grove", "golden_wheat",
+            "midnight_sky", "cloudy_day", "city_lights", "creamy_latte",
+            "deep_space", "fresh_breeze", "matrix_code", "ocean_blue",
+            "fire_red", "forest_green", "purple_haze", "sunset_orange",
+            "arctic_white", "midnight_purple", "desert_gold", "cyber_pink",
+        ]
+        current_theme = self.options.get("theme", "classic_blue")
+        theme_idx = themes.index(current_theme) if current_theme in themes else 0
+        items = [
+            ("header", "Display", None),
+            ("bool", "Line Numbers", "number"),
+            ("bool", "Relative Numbers", "relativenumber"),
+            ("bool", "Indent Guides", "indent_guides"),
+            ("bool", "Cursor Line Highlight", "cursorline"),
+            ("bool", "Word Wrap", "wrap"),
+            ("bool", "Status Line", "statusline"),
+            ("bool", "Tab/Buffer Bar", "tabline"),
+            ("bool", "Show Command", "show_command"),
+            ("header", "Editor", None),
+            ("bool", "Mouse Support", "mouse"),
+            ("bool", "Error Lens (inline diag)", "error_lens"),
+            ("bool", "Bracket Highlight", "bracket_highlight"),
+            ("bool", "Word Highlight", "word_highlight"),
+            ("bool", "Auto Save", "autosave"),
+            ("int", "Tab Size", "tabsize"),
+            ("int", "Auto Save Delay (s)", "autosave_delay"),
+            ("header", "Panels", None),
+            ("bool", "File Explorer", "explorer"),
+            ("bool", "Minimap", "minimap"),
+            ("header", "Appearance", None),
+            ("theme", "Theme", (themes, theme_idx)),
+            ("header", "", None),
+            ("action", "[S] Save Config to evimrc.py", "save"),
+            ("action", "[R] Reload Config", "reload"),
+            ("header", "", None),
+            ("info", f"Terminal Colors: {self._color_depth}", None),
+            ("info", f"Language: {self.syntax_language or 'none'}", None),
+            ("info", f"File: {self.filepath or '[No Name]'}", None),
+        ]
+        return items
+
+    def draw_menu(self, stdscr, height, width):
+        """Draw the Emacs-style settings menu overlay."""
+        bg = getattr(self, 'color_bg', curses.A_NORMAL)
+        hl = getattr(self, 'color_menu_hl', curses.A_REVERSE)
+        hdr_attr = getattr(self, 'color_menu_header', curses.A_BOLD | curses.A_REVERSE)
+        items = self._get_menu_items()
+        # Box dimensions
+        box_w = min(50, width - 4)
+        box_h = min(len(items) + 4, height - 2)
+        box_x = max(0, (width - box_w) // 2)
+        box_y = max(0, (height - box_h) // 2)
+        # Draw box background
+        for row in range(box_h):
+            y = box_y + row
+            if y >= height:
+                break
+            try:
+                stdscr.addstr(y, box_x, " " * box_w, bg)
+            except curses.error:
+                pass
+        # Title bar
+        title = " EVim Settings (F10 / Alt+x) "
+        title_line = "╔" + title.center(box_w - 2, "═") + "╗"
+        try:
+            stdscr.addstr(box_y, box_x, title_line[:box_w], hdr_attr)
+        except curses.error:
+            pass
+        # Items
+        visible_items = box_h - 3  # title + bottom border + hint
+        scroll = max(0, self.menu_cursor - visible_items + 2)
+        for i in range(visible_items):
+            item_idx = scroll + i
+            y = box_y + 1 + i
+            if y >= box_y + box_h - 2:
+                break
+            if item_idx >= len(items):
+                try:
+                    stdscr.addstr(y, box_x, "║" + " " * (box_w - 2) + "║", bg)
+                except curses.error:
+                    pass
+                continue
+            kind, label, data = items[item_idx]
+            is_selected = (item_idx == self.menu_cursor)
+            attr = hl if is_selected else bg
+            if kind == "header":
+                line_text = f"║ ── {label} ──".ljust(box_w - 1) + "║"
+                try:
+                    stdscr.addstr(y, box_x, line_text[:box_w], hdr_attr if label else bg)
+                except curses.error:
+                    pass
+                continue
+            elif kind == "bool":
+                val = self.options.get(data, False)
+                checkbox = "[x]" if val else "[ ]"
+                line_text = f"║  {checkbox} {label}".ljust(box_w - 1) + "║"
+            elif kind == "int":
+                val = self.options.get(data, 0)
+                line_text = f"║    {label}: {val}  (←/→ to change)".ljust(box_w - 1) + "║"
+            elif kind == "theme":
+                themes, tidx = data
+                current = themes[tidx % len(themes)]
+                display = current.replace("_", " ").title()
+                line_text = f"║  ◀ {display} ▶  (←/→ to change)".ljust(box_w - 1) + "║"
+            elif kind == "action":
+                line_text = f"║  {label}".ljust(box_w - 1) + "║"
+            elif kind == "info":
+                line_text = f"║    {label}".ljust(box_w - 1) + "║"
+            else:
+                line_text = f"║  {label}".ljust(box_w - 1) + "║"
+            try:
+                stdscr.addstr(y, box_x, line_text[:box_w], attr)
+            except curses.error:
+                pass
+        # Bottom border + hint
+        hint = " Enter:Toggle  ←→:Adjust  S:Save  Esc:Close "
+        bottom = "╚" + hint.center(box_w - 2, "═") + "╝"
+        try:
+            stdscr.addstr(box_y + box_h - 1, box_x, bottom[:box_w], hdr_attr)
+        except curses.error:
+            pass
+
+    def handle_menu_key(self, stdscr):
+        """Handle key input in the settings menu."""
+        ch = stdscr.getch()
+        if ch < 0:
+            return
+        items = self._get_menu_items()
+        # Close menu
+        if ch in (27, curses.KEY_F5, ord('q'), ord('Q')):
+            self.menu_visible = False
+            self.message = "Menu closed"
+            return
+        # Navigate
+        if ch == curses.KEY_UP or ch == ord('k'):
+            self.menu_cursor = max(0, self.menu_cursor - 1)
+            # Skip headers
+            while self.menu_cursor > 0 and items[self.menu_cursor][0] in ("header", "info"):
+                self.menu_cursor -= 1
+            if items[self.menu_cursor][0] in ("header", "info"):
+                self.menu_cursor += 1
+                while self.menu_cursor < len(items) and items[self.menu_cursor][0] in ("header", "info"):
+                    self.menu_cursor += 1
+            return
+        if ch == curses.KEY_DOWN or ch == ord('j'):
+            self.menu_cursor = min(len(items) - 1, self.menu_cursor + 1)
+            # Skip headers
+            while self.menu_cursor < len(items) - 1 and items[self.menu_cursor][0] in ("header", "info"):
+                self.menu_cursor += 1
+            return
+        # Save shortcut
+        if ch == ord('s') or ch == ord('S'):
+            self.save_config()
+            self.menu_visible = False
+            return
+        # Reload config shortcut
+        if ch == ord('r') or ch == ord('R'):
+            self.load_config()
+            self.menu_visible = False
+            return
+        if self.menu_cursor >= len(items):
+            return
+        kind, label, data = items[self.menu_cursor]
+        # Toggle bool
+        if kind == "bool" and ch in (curses.KEY_ENTER, 10, 13, ord(' ')):
+            self.options[data] = not self.options.get(data, False)
+            # Apply side effects
+            if data == "explorer":
+                if self.options[data]:
+                    self.explorer_toggle()
+                else:
+                    self.explorer_visible = False
+            elif data == "minimap":
+                self.minimap_visible = self.options[data]
+            self.message = f"{label}: {'ON' if self.options[data] else 'OFF'}"
+            return
+        # Adjust int
+        if kind == "int":
+            if ch == curses.KEY_RIGHT or ch == ord('l'):
+                self.options[data] = self.options.get(data, 0) + 1
+                self.message = f"{label}: {self.options[data]}"
+                return
+            if ch == curses.KEY_LEFT or ch == ord('h'):
+                self.options[data] = max(1, self.options.get(data, 0) - 1)
+                self.message = f"{label}: {self.options[data]}"
+                return
+        # Adjust theme
+        if kind == "theme":
+            themes, tidx = data
+            if ch == curses.KEY_RIGHT or ch == ord('l') or ch in (curses.KEY_ENTER, 10, 13, ord(' ')):
+                tidx = (tidx + 1) % len(themes)
+                self.set_theme(themes[tidx])
+                return
+            if ch == curses.KEY_LEFT or ch == ord('h'):
+                tidx = (tidx - 1) % len(themes)
+                self.set_theme(themes[tidx])
+                return
+        # Action items
+        if kind == "action" and ch in (curses.KEY_ENTER, 10, 13, ord(' ')):
+            if data == "save":
+                self.save_config()
+                self.menu_visible = False
+            elif data == "reload":
+                self.load_config()
+                self.menu_visible = False
+            return
+
+    # ── Save Config ────────────────────────────────────────────────
+
+    def save_config(self):
+        """Save current settings to evimrc.py in the current directory."""
+        config_path = Path.cwd() / "evimrc.py"
+        lines = [
+            "# evim config file — this is Python!",
+            "# Auto-saved by EVim settings menu (F10)",
+            "# The 'editor' object is available for customization.",
+            "editor = None  # Set by evim.py when loading",
+            "",
+            "# Theme",
+            f"editor.set_theme('{self.options.get('theme', 'classic_blue')}')",
+            "",
+            "# Display options",
+        ]
+        bool_opts = [
+            ('number', 'Line Numbers'),
+            ('relativenumber', 'Relative Numbers'),
+            ('indent_guides', 'Indent Guides'),
+            ('cursorline', 'Cursor Line'),
+            ('wrap', 'Word Wrap'),
+            ('statusline', 'Status Line'),
+            ('tabline', 'Tab Bar'),
+            ('show_command', 'Show Command'),
+        ]
+        for opt, comment in bool_opts:
+            lines.append(f"editor.options['{opt}'] = {self.options.get(opt, False)}")
+        lines.append("")
+        lines.append("# Editor options")
+        editor_opts = [
+            ('mouse', 'Mouse'),
+            ('error_lens', 'Error Lens'),
+            ('bracket_highlight', 'Bracket Highlight'),
+            ('word_highlight', 'Word Highlight'),
+            ('autosave', 'Auto Save'),
+        ]
+        for opt, comment in editor_opts:
+            lines.append(f"editor.options['{opt}'] = {self.options.get(opt, False)}")
+        lines.append(f"editor.options['tabsize'] = {self.options.get('tabsize', 4)}")
+        lines.append(f"editor.options['autosave_delay'] = {self.options.get('autosave_delay', 5)}")
+        lines.append("")
+        lines.append("# Panel options")
+        lines.append(f"editor.options['explorer'] = {self.options.get('explorer', False)}")
+        lines.append(f"editor.options['minimal'] = {self.options.get('minimal', False)}")
+        lines.append("")
+        lines.append("editor.message = 'Config Loaded'")
+        try:
+            config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            self.message = f"Config saved to {config_path.name}"
+        except Exception as exc:
+            self.message = f"Save config failed: {exc}"
+
+    # ── Recent Files ───────────────────────────────────────────────
+
+    def _load_recent_files(self):
+        """Load recent files list from disk."""
+        try:
+            if self._recent_file_path.exists():
+                self.recent_files = json.loads(self._recent_file_path.read_text())[:self.recent_files_max]
+        except Exception:
+            self.recent_files = []
+
+    def _save_recent_files(self):
+        """Persist recent files list."""
+        try:
+            self._recent_file_path.parent.mkdir(parents=True, exist_ok=True)
+            self._recent_file_path.write_text(json.dumps(self.recent_files[:self.recent_files_max]))
+        except Exception:
+            pass
+
+    def _add_recent_file(self, filepath):
+        """Add a file to the recent files list."""
+        abspath = str(Path(filepath).resolve())
+        if abspath in self.recent_files:
+            self.recent_files.remove(abspath)
+        self.recent_files.insert(0, abspath)
+        self.recent_files = self.recent_files[:self.recent_files_max]
+        self._save_recent_files()
+
+    # ── Kill Ring ──────────────────────────────────────────────────
+
+    def kill_ring_push(self, text):
+        """Push text onto the kill ring."""
+        if not text:
+            return
+        self.kill_ring.insert(0, text)
+        if len(self.kill_ring) > self.kill_ring_max:
+            self.kill_ring.pop()
+        self.kill_ring_idx = 0
+
+    def kill_ring_yank(self):
+        """Paste from kill ring at current position."""
+        if not self.kill_ring:
+            self.message = "Kill ring empty"
+            return
+        text = self.kill_ring[self.kill_ring_idx]
+        self.snapshot()
+        for ch in text:
+            if ch == '\n':
+                self.newline()
+            else:
+                self.insert_char(ch)
+        self.mark_dirty()
+        self.message = f"Yanked from kill ring [{self.kill_ring_idx + 1}/{len(self.kill_ring)}]"
+
+    def kill_ring_rotate(self):
+        """Rotate through kill ring (like Emacs M-y)."""
+        if len(self.kill_ring) < 2:
+            self.message = "Kill ring has only one entry"
+            return
+        self.kill_ring_idx = (self.kill_ring_idx + 1) % len(self.kill_ring)
+        self.message = f"Kill ring [{self.kill_ring_idx + 1}/{len(self.kill_ring)}]: {self.kill_ring[self.kill_ring_idx][:40]}"
+
+    # ── Incremental Search ─────────────────────────────────────────
+
+    def isearch_start(self):
+        """Start incremental search (Ctrl+f / C-s Emacs style)."""
+        self._isearch_active = True
+        self._isearch_matches = []
+        self._isearch_idx = 0
+        self._isearch_origin = (self.cy, self.cx)
+        self.mode = "command"
+        self.command = "/"
+        self.message = "I-Search: "
+
+    def isearch_update(self, pattern):
+        """Update incremental search matches as user types."""
+        self._isearch_matches = []
+        if not pattern:
+            return
+        try:
+            regex = re.compile(re.escape(pattern), re.IGNORECASE)
+        except re.error:
+            return
+        for i, line in enumerate(self.lines):
+            for m in regex.finditer(line):
+                self._isearch_matches.append((i, m.start(), m.end() - m.start()))
+        # Jump to first match at or after origin
+        if self._isearch_matches:
+            oy, ox = self._isearch_origin
+            for idx, (line, col, _) in enumerate(self._isearch_matches):
+                if line > oy or (line == oy and col >= ox):
+                    self._isearch_idx = idx
+                    self.cy = line
+                    self.cx = col
+                    return
+            # Wrap around
+            self._isearch_idx = 0
+            self.cy = self._isearch_matches[0][0]
+            self.cx = self._isearch_matches[0][1]
+
+    def isearch_next(self):
+        """Jump to next incremental search match."""
+        if not self._isearch_matches:
+            return
+        self._isearch_idx = (self._isearch_idx + 1) % len(self._isearch_matches)
+        line, col, _ = self._isearch_matches[self._isearch_idx]
+        self.cy = line
+        self.cx = col
+
+    def isearch_prev(self):
+        """Jump to previous incremental search match."""
+        if not self._isearch_matches:
+            return
+        self._isearch_idx = (self._isearch_idx - 1) % len(self._isearch_matches)
+        line, col, _ = self._isearch_matches[self._isearch_idx]
+        self.cy = line
+        self.cx = col
+
+    # ── Code Folding ───────────────────────────────────────────────
+
+    def fold_toggle(self):
+        """Toggle fold at current line (za)."""
+        if self.cy in self.folds:
+            del self.folds[self.cy]
+            self.message = "Fold opened"
+        else:
+            end = self._find_fold_end(self.cy)
+            if end > self.cy:
+                self.folds[self.cy] = end
+                self.message = f"Folded lines {self.cy + 1}-{end + 1}"
+
+    def fold_open(self):
+        """Open fold at current line (zo)."""
+        if self.cy in self.folds:
+            del self.folds[self.cy]
+            self.message = "Fold opened"
+        else:
+            # Check if we're inside a fold
+            for start, end in list(self.folds.items()):
+                if start < self.cy <= end:
+                    del self.folds[start]
+                    self.message = "Fold opened"
+                    return
+
+    def fold_close(self):
+        """Close fold at current line (zc)."""
+        end = self._find_fold_end(self.cy)
+        if end > self.cy:
+            self.folds[self.cy] = end
+            self.message = f"Folded lines {self.cy + 1}-{end + 1}"
+
+    def fold_all(self):
+        """Fold all top-level blocks (zM)."""
+        self.folds.clear()
+        i = 0
+        while i < len(self.lines):
+            end = self._find_fold_end(i)
+            if end > i:
+                self.folds[i] = end
+                i = end + 1
+            else:
+                i += 1
+        self.message = f"Folded {len(self.folds)} regions"
+
+    def unfold_all(self):
+        """Open all folds (zR)."""
+        count = len(self.folds)
+        self.folds.clear()
+        self.message = f"Opened {count} folds"
+
+    def _find_fold_end(self, start_line):
+        """Find the end of a foldable block starting at start_line."""
+        if start_line >= len(self.lines):
+            return start_line
+        line = self.lines[start_line]
+        stripped = line.lstrip()
+        if not stripped:
+            return start_line
+        base_indent = len(line) - len(stripped)
+        # Look for indented block following this line
+        end = start_line
+        for i in range(start_line + 1, len(self.lines)):
+            ln = self.lines[i]
+            if not ln.strip():  # blank lines are part of the fold
+                end = i
+                continue
+            indent = len(ln) - len(ln.lstrip())
+            if indent > base_indent:
+                end = i
+            else:
+                break
+        return end
+
+    def _visible_line_index(self, display_row):
+        """Convert a display row to actual line index, accounting for folds."""
+        actual = 0
+        display = 0
+        while actual < len(self.lines) and display < display_row:
+            if actual in self.folds:
+                actual = self.folds[actual] + 1
+            else:
+                actual += 1
+            display += 1
+        return actual
+
+    def _display_line_count(self):
+        """Count visible lines (not hidden by folds)."""
+        count = 0
+        i = 0
+        while i < len(self.lines):
+            count += 1
+            if i in self.folds:
+                i = self.folds[i] + 1
+            else:
+                i += 1
+        return count
+
+    # ── Right-Click Context Menu ───────────────────────────────────
+
+    def _show_context_menu(self, stdscr, mx, my):
+        """Show a right-click context menu at the given position."""
+        self._ctx_menu_items = [
+            ("Cut", self._ctx_cut),
+            ("Copy", self._ctx_copy),
+            ("Paste", self._ctx_paste),
+            ("─────────", None),
+            ("Select All", self._ctx_select_all),
+            ("─────────", None),
+            ("Go to Definition", self._ctx_goto_def),
+            ("Find References", self._ctx_find_refs),
+            ("─────────", None),
+            ("Fold/Unfold", lambda: self.fold_toggle()),
+            ("Toggle Comment", lambda: self.toggle_comment()),
+            ("─────────", None),
+            ("Close Buffer", self._ctx_close_buffer),
+        ]
+        self._ctx_menu_visible = True
+        self._ctx_menu_x = mx
+        self._ctx_menu_y = my
+        self._ctx_menu_cursor = 0
+
+    def _draw_context_menu(self, stdscr, height, width):
+        """Draw the right-click context menu."""
+        if not self._ctx_menu_visible:
+            return
+        items = self._ctx_menu_items
+        menu_w = max(len(label) for label, _ in items) + 4
+        menu_h = len(items) + 2
+        x = min(self._ctx_menu_x, width - menu_w - 1)
+        y = min(self._ctx_menu_y, height - menu_h - 1)
+        bg = getattr(self, 'color_bg', curses.A_NORMAL)
+        hl = getattr(self, 'color_menu_hl', curses.A_REVERSE)
+        # Border top
+        try:
+            stdscr.addstr(y, x, "┌" + "─" * (menu_w - 2) + "┐", bg | curses.A_BOLD)
+        except curses.error:
+            pass
+        for i, (label, action) in enumerate(items):
+            row = y + 1 + i
+            is_sep = action is None
+            is_sel = (i == self._ctx_menu_cursor and not is_sep)
+            attr = hl if is_sel else bg
+            if is_sep:
+                line = "├" + "─" * (menu_w - 2) + "┤"
+            else:
+                line = "│ " + label.ljust(menu_w - 4) + " │"
+            try:
+                stdscr.addstr(row, x, line, attr)
+            except curses.error:
+                pass
+        # Border bottom
+        try:
+            stdscr.addstr(y + menu_h - 1, x, "└" + "─" * (menu_w - 2) + "┘", bg | curses.A_BOLD)
+        except curses.error:
+            pass
+
+    def _handle_context_menu_key(self, ch):
+        """Handle keys while context menu is visible."""
+        items = self._ctx_menu_items
+        if ch == 27 or ch == ord('q'):  # ESC / q
+            self._ctx_menu_visible = False
+            return True
+        if ch == curses.KEY_UP or ch == ord('k'):
+            self._ctx_menu_cursor = max(0, self._ctx_menu_cursor - 1)
+            while self._ctx_menu_cursor > 0 and items[self._ctx_menu_cursor][1] is None:
+                self._ctx_menu_cursor -= 1
+            if items[self._ctx_menu_cursor][1] is None:
+                self._ctx_menu_cursor += 1
+            return True
+        if ch == curses.KEY_DOWN or ch == ord('j'):
+            self._ctx_menu_cursor = min(len(items) - 1, self._ctx_menu_cursor + 1)
+            while self._ctx_menu_cursor < len(items) - 1 and items[self._ctx_menu_cursor][1] is None:
+                self._ctx_menu_cursor += 1
+            return True
+        if ch in (curses.KEY_ENTER, 10, 13, ord(' ')):
+            label, action = items[self._ctx_menu_cursor]
+            self._ctx_menu_visible = False
+            if action:
+                action()
+            return True
+        # Mouse click on menu item
+        if ch == curses.KEY_MOUSE:
+            try:
+                _, mx, my, _, bstate = curses.getmouse()
+                if bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED):
+                    idx = my - self._ctx_menu_y - 1
+                    if 0 <= idx < len(items) and items[idx][1] is not None:
+                        self._ctx_menu_visible = False
+                        items[idx][1]()
+                    else:
+                        self._ctx_menu_visible = False
+                    return True
+            except curses.error:
+                pass
+            self._ctx_menu_visible = False
+            return True
+        return True  # consume all keys while menu is open
+
+    def _ctx_cut(self):
+        if self.selection:
+            self.snapshot()
+            self.yank_selection()
+            text = self.clipboard
+            self.kill_ring_push(text)
+            self.delete_selection()
+        else:
+            self.snapshot()
+            text = self.lines[self.cy]
+            self.kill_ring_push(text)
+            self.delete_line()
+
+    def _ctx_copy(self):
+        if self.selection:
+            self.yank_selection()
+            self.kill_ring_push(self.clipboard)
+        else:
+            self.yank_line()
+            self.kill_ring_push(self.clipboard)
+
+    def _ctx_paste(self):
+        self.snapshot()
+        if self.kill_ring:
+            text = self.kill_ring[0]
+            for ch in text:
+                if ch == '\n':
+                    self.newline()
+                else:
+                    self.insert_char(ch)
+        elif self.clipboard:
+            self.paste()
+
+    def _ctx_select_all(self):
+        self.selection = (0, 0)
+        self.cy = len(self.lines) - 1
+        self.cx = len(self.lines[self.cy])
+        self.message = "All text selected"
+
+    def _ctx_goto_def(self):
+        if self.lsp_enabled and self.lsp_initialized:
+            self.lsp_goto_definition()
+
+    def _ctx_find_refs(self):
+        if self.lsp_enabled and self.lsp_initialized:
+            self.lsp_find_references()
+
+    def _ctx_close_buffer(self):
+        if len(self.buffer_order) <= 1:
+            self.message = "Cannot close last buffer"
+            return
+        path = self.filepath
+        idx = self.current_buffer_idx
+        del self.buffers[path]
+        self.buffer_order.remove(path)
+        self.current_buffer_idx = min(idx, len(self.buffer_order) - 1)
+        self.filepath = self.buffer_order[self.current_buffer_idx]
+        self.lines = self.buffers[self.filepath][:]
+        self.cy = min(self.cy, len(self.lines) - 1)
+        self.cx = 0
+        self.message = f"Closed buffer: {os.path.basename(path)}"
+
+    # ── Command Palette ────────────────────────────────────────────
+
+    def _build_palette_commands(self):
+        """Build the full list of commands for the palette."""
+        cmds = [
+            ("Save File", lambda: self.quick_save()),
+            ("Save As...", lambda: setattr(self, 'message', 'Use :w <filename>')),
+            ("Open File (Fuzzy)", lambda: self.fuzzy_find()),
+            ("Close Buffer", lambda: self._ctx_close_buffer()),
+            ("Next Buffer", lambda: self.next_buffer()),
+            ("Previous Buffer", lambda: self.prev_buffer()),
+            ("Toggle File Explorer", lambda: self.explorer_toggle()),
+            ("Toggle Terminal", lambda: self.term_toggle()),
+            ("Toggle Minimap", lambda: self.minimap_toggle()),
+            ("Toggle Line Numbers", lambda: self.options.__setitem__('number', not self.options.get('number'))),
+            ("Toggle Relative Numbers", lambda: self.options.__setitem__('relativenumber', not self.options.get('relativenumber'))),
+            ("Toggle Word Wrap", lambda: self.options.__setitem__('wrap', not self.options.get('wrap'))),
+            ("Toggle Indent Guides", lambda: self.options.__setitem__('indent_guides', not self.options.get('indent_guides'))),
+            ("Toggle Error Lens", lambda: self.options.__setitem__('error_lens', not self.options.get('error_lens'))),
+            ("Toggle Bracket Highlight", lambda: self.options.__setitem__('bracket_highlight', not self.options.get('bracket_highlight'))),
+            ("Toggle Word Highlight", lambda: self.options.__setitem__('word_highlight', not self.options.get('word_highlight'))),
+            ("Toggle Auto Save", lambda: self.options.__setitem__('autosave', not self.options.get('autosave'))),
+            ("Toggle Mouse", lambda: self.options.__setitem__('mouse', not self.options.get('mouse'))),
+            ("Settings Menu", lambda: setattr(self, 'menu_visible', True)),
+            ("Fold Toggle (za)", lambda: self.fold_toggle()),
+            ("Fold All (zM)", lambda: self.fold_all()),
+            ("Unfold All (zR)", lambda: self.unfold_all()),
+            ("Go to Definition", lambda: self.lsp_goto_definition() if self.lsp_enabled else None),
+            ("Find References", lambda: self.lsp_find_references() if self.lsp_enabled else None),
+            ("Start LSP", lambda: self.lsp_start()),
+            ("Stop LSP", lambda: self.lsp_stop()),
+            ("Toggle Comment", lambda: self.toggle_comment()),
+            ("Sort Lines", lambda: self._sort_lines()),
+            ("Duplicate Line", lambda: (self.snapshot(), self.duplicate_line())),
+            ("Move Line Up", lambda: (self.snapshot(), self.move_line_up())),
+            ("Move Line Down", lambda: (self.snapshot(), self.move_line_down())),
+            ("Select All", lambda: self._ctx_select_all()),
+            ("Kill Ring Paste", lambda: self.kill_ring_yank()),
+            ("Kill Ring Rotate", lambda: self.kill_ring_rotate()),
+            ("Save Config", lambda: self.save_config()),
+            ("Recent Files", lambda: self._show_recent_files()),
+            ("Symbol Outline", lambda: self._build_outline()),
+            ("Project Grep", lambda: setattr(self, 'message', 'Use :grep <pattern>')),
+            ("Help", lambda: setattr(self, 'mode', 'overlay')),
+            ("Quit", lambda: setattr(self, 'should_exit', True)),
+        ]
+        return cmds
+
+    def palette_open(self):
+        """Open the command palette (Ctrl+Shift+P / M-x style)."""
+        self._palette_visible = True
+        self._palette_query = ""
+        self._palette_items = self._build_palette_commands()
+        self._palette_filtered = self._palette_items[:]
+        self._palette_cursor = 0
+
+    def _palette_filter(self):
+        """Filter palette items by fuzzy query."""
+        if not self._palette_query:
+            self._palette_filtered = self._palette_items[:]
+        else:
+            q = self._palette_query.lower()
+            scored = []
+            for label, action in self._palette_items:
+                ll = label.lower()
+                if q in ll:
+                    # Prefer prefix matches
+                    score = 0 if ll.startswith(q) else 1
+                    scored.append((score, label, action))
+                else:
+                    # Fuzzy: all chars must appear in order
+                    qi = 0
+                    for c in ll:
+                        if qi < len(q) and c == q[qi]:
+                            qi += 1
+                    if qi == len(q):
+                        scored.append((2, label, action))
+            scored.sort(key=lambda x: x[0])
+            self._palette_filtered = [(label, action) for _, label, action in scored]
+        self._palette_cursor = min(self._palette_cursor, max(0, len(self._palette_filtered) - 1))
+
+    def draw_palette(self, stdscr, height, width):
+        """Draw the command palette overlay."""
+        if not self._palette_visible:
+            return
+        bg = getattr(self, 'color_bg', curses.A_NORMAL)
+        hl = getattr(self, 'color_menu_hl', curses.A_REVERSE)
+        hdr_attr = getattr(self, 'color_menu_header', curses.A_BOLD | curses.A_REVERSE)
+        box_w = min(60, width - 4)
+        box_h = min(20, height - 4)
+        box_x = max(0, (width - box_w) // 2)
+        box_y = max(1, height // 6)
+        # Input line
+        prompt = f" > {self._palette_query}█"
+        try:
+            stdscr.addstr(box_y, box_x, "╔" + "═" * (box_w - 2) + "╗", hdr_attr)
+            stdscr.addstr(box_y + 1, box_x, ("║" + prompt.ljust(box_w - 2)[:box_w - 2] + "║"), hdr_attr)
+            stdscr.addstr(box_y + 2, box_x, "╠" + "═" * (box_w - 2) + "╣", hdr_attr)
+        except curses.error:
+            pass
+        # Items
+        visible = box_h - 5
+        scroll = max(0, self._palette_cursor - visible + 1)
+        for i in range(visible):
+            idx = scroll + i
+            row = box_y + 3 + i
+            if row >= box_y + box_h - 1:
+                break
+            if idx < len(self._palette_filtered):
+                label, _ = self._palette_filtered[idx]
+                attr = hl if idx == self._palette_cursor else bg
+                text = ("║ " + label).ljust(box_w - 1)[:box_w - 1] + "║"
+            else:
+                text = "║" + " " * (box_w - 2) + "║"
+                attr = bg
+            try:
+                stdscr.addstr(row, box_x, text, attr)
+            except curses.error:
+                pass
+        # Bottom
+        count_text = f" {len(self._palette_filtered)} commands "
+        bottom = "╚" + count_text.center(box_w - 2, "═") + "╝"
+        try:
+            stdscr.addstr(box_y + box_h - 1, box_x, bottom[:box_w], hdr_attr)
+        except curses.error:
+            pass
+
+    def handle_palette_key(self, stdscr):
+        """Handle input in the command palette."""
+        ch = stdscr.getch()
+        if ch < 0:
+            return
+        if ch == 27:  # ESC
+            self._palette_visible = False
+            return
+        if ch in (curses.KEY_ENTER, 10, 13):
+            if self._palette_filtered:
+                _, action = self._palette_filtered[self._palette_cursor]
+                self._palette_visible = False
+                if action:
+                    action()
+            else:
+                self._palette_visible = False
+            return
+        if ch == curses.KEY_UP:
+            self._palette_cursor = max(0, self._palette_cursor - 1)
+            return
+        if ch == curses.KEY_DOWN:
+            self._palette_cursor = min(len(self._palette_filtered) - 1, self._palette_cursor + 1)
+            return
+        if ch in (curses.KEY_BACKSPACE, 127, curses.ascii.DEL):
+            self._palette_query = self._palette_query[:-1]
+            self._palette_filter()
+            return
+        if 0 <= ch < 256 and curses.ascii.isprint(ch):
+            self._palette_query += chr(ch)
+            self._palette_filter()
+            return
+
+    # ── Project Grep ───────────────────────────────────────────────
+
+    def project_grep(self, pattern, path="."):
+        """Search across project files using grep/ripgrep."""
+        self._grep_results = []
+        self._grep_cursor = 0
+        try:
+            # Prefer ripgrep, fall back to grep
+            for cmd in (['rg', '--no-heading', '-n', pattern, path],
+                        ['grep', '-rn', pattern, path]):
+                try:
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                    break
+                except FileNotFoundError:
+                    continue
+            else:
+                self.message = "Neither rg nor grep found"
+                return
+            for line in result.stdout.splitlines()[:500]:
+                parts = line.split(":", 2)
+                if len(parts) >= 3:
+                    self._grep_results.append((parts[0], int(parts[1]), parts[2]))
+            if self._grep_results:
+                self._grep_visible = True
+                self.message = f"Grep: {len(self._grep_results)} matches for '{pattern}'"
+            else:
+                self.message = f"Grep: no matches for '{pattern}'"
+        except Exception as e:
+            self.message = f"Grep error: {e}"
+
+    def draw_grep_results(self, stdscr, height, width):
+        """Draw grep results overlay."""
+        if not self._grep_visible or not self._grep_results:
+            return
+        bg = getattr(self, 'color_bg', curses.A_NORMAL)
+        hl = getattr(self, 'color_menu_hl', curses.A_REVERSE)
+        hdr = getattr(self, 'color_menu_header', curses.A_BOLD | curses.A_REVERSE)
+        box_w = min(80, width - 4)
+        box_h = min(25, height - 4)
+        box_x = max(0, (width - box_w) // 2)
+        box_y = max(0, (height - box_h) // 2)
+        title = f" Grep Results ({len(self._grep_results)} matches) "
+        try:
+            stdscr.addstr(box_y, box_x, ("╔" + title.center(box_w - 2, "═") + "╗")[:box_w], hdr)
+        except curses.error:
+            pass
+        visible = box_h - 3
+        scroll = max(0, self._grep_cursor - visible + 2)
+        for i in range(visible):
+            idx = scroll + i
+            row = box_y + 1 + i
+            if idx < len(self._grep_results):
+                fpath, lineno, text = self._grep_results[idx]
+                entry = f"  {fpath}:{lineno}: {text}"
+                attr = hl if idx == self._grep_cursor else bg
+            else:
+                entry = ""
+                attr = bg
+            line = ("║" + entry).ljust(box_w - 1)[:box_w - 1] + "║"
+            try:
+                stdscr.addstr(row, box_x, line, attr)
+            except curses.error:
+                pass
+        hint = " Enter:Open  j/k:Navigate  Esc:Close "
+        try:
+            stdscr.addstr(box_y + box_h - 1, box_x, ("╚" + hint.center(box_w - 2, "═") + "╝")[:box_w], hdr)
+        except curses.error:
+            pass
+
+    def handle_grep_key(self, stdscr):
+        """Handle keys in grep results view."""
+        ch = stdscr.getch()
+        if ch < 0:
+            return
+        if ch == 27 or ch == ord('q'):
+            self._grep_visible = False
+            return
+        if ch == curses.KEY_UP or ch == ord('k'):
+            self._grep_cursor = max(0, self._grep_cursor - 1)
+            return
+        if ch == curses.KEY_DOWN or ch == ord('j'):
+            self._grep_cursor = min(len(self._grep_results) - 1, self._grep_cursor + 1)
+            return
+        if ch in (curses.KEY_ENTER, 10, 13):
+            if self._grep_results:
+                fpath, lineno, _ = self._grep_results[self._grep_cursor]
+                self._grep_visible = False
+                abspath = str(Path(fpath).resolve())
+                if abspath != os.path.abspath(self.filepath or ""):
+                    self.open_buffer(abspath)
+                self.cy = max(0, lineno - 1)
+                self.cx = 0
+            return
+
+    # ── Symbol Outline ─────────────────────────────────────────────
+
+    def _build_outline(self):
+        """Build a symbol outline from current file."""
+        self._outline_items = []
+        lang = self.syntax_language or ""
+        patterns = []
+        if lang in ("python",):
+            patterns = [
+                (r'^\s*(class\s+\w+)', 'class'),
+                (r'^\s*(def\s+\w+)', 'function'),
+                (r'^(\w+)\s*=', 'variable'),
+            ]
+        elif lang in ("javascript", "typescript", "jsx", "tsx"):
+            patterns = [
+                (r'^\s*(class\s+\w+)', 'class'),
+                (r'^\s*(?:export\s+)?(?:async\s+)?function\s+(\w+)', 'function'),
+                (r'^\s*(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?\(', 'function'),
+                (r'^\s*(\w+)\s*\(', 'method'),
+            ]
+        elif lang in ("c", "cpp", "rust", "go", "java"):
+            patterns = [
+                (r'^\s*(?:pub\s+)?(?:fn|func|void|int|char|auto|static)\s+(\w+)\s*\(', 'function'),
+                (r'^\s*(?:struct|class|enum|type)\s+(\w+)', 'class'),
+            ]
+        else:
+            # Generic: look for function-like patterns
+            patterns = [
+                (r'^\s*(?:def|fn|func|function|sub|proc)\s+(\w+)', 'function'),
+                (r'^\s*(?:class|struct|enum|type|interface)\s+(\w+)', 'class'),
+            ]
+        for i, line in enumerate(self.lines):
+            for pat, kind in patterns:
+                m = re.match(pat, line)
+                if m:
+                    name = m.group(1)
+                    self._outline_items.append((name, kind, i))
+                    break
+        if self._outline_items:
+            self._outline_visible = True
+            self._outline_cursor = 0
+            self.message = f"Outline: {len(self._outline_items)} symbols"
+        else:
+            self.message = "No symbols found"
+
+    def draw_outline(self, stdscr, height, width):
+        """Draw symbol outline overlay."""
+        if not self._outline_visible:
+            return
+        bg = getattr(self, 'color_bg', curses.A_NORMAL)
+        hl = getattr(self, 'color_menu_hl', curses.A_REVERSE)
+        hdr = getattr(self, 'color_menu_header', curses.A_BOLD | curses.A_REVERSE)
+        box_w = min(50, width - 4)
+        box_h = min(len(self._outline_items) + 4, height - 2)
+        box_x = max(0, (width - box_w) // 2)
+        box_y = max(0, (height - box_h) // 2)
+        title = f" Symbol Outline ({len(self._outline_items)}) "
+        try:
+            stdscr.addstr(box_y, box_x, ("╔" + title.center(box_w - 2, "═") + "╗")[:box_w], hdr)
+        except curses.error:
+            pass
+        visible = box_h - 3
+        scroll = max(0, self._outline_cursor - visible + 2)
+        icons = {'function': 'ƒ', 'class': '◆', 'method': '●', 'variable': '▸'}
+        for i in range(visible):
+            idx = scroll + i
+            row = box_y + 1 + i
+            if idx < len(self._outline_items):
+                name, kind, lineno = self._outline_items[idx]
+                icon = icons.get(kind, '·')
+                entry = f"  {icon} {name}  :{lineno + 1}"
+                attr = hl if idx == self._outline_cursor else bg
+            else:
+                entry = ""
+                attr = bg
+            line = ("║" + entry).ljust(box_w - 1)[:box_w - 1] + "║"
+            try:
+                stdscr.addstr(row, box_x, line, attr)
+            except curses.error:
+                pass
+        try:
+            stdscr.addstr(box_y + box_h - 1, box_x, ("╚" + "═" * (box_w - 2) + "╝")[:box_w], hdr)
+        except curses.error:
+            pass
+
+    def handle_outline_key(self, stdscr):
+        """Handle keys in outline view."""
+        ch = stdscr.getch()
+        if ch < 0:
+            return
+        if ch == 27 or ch == ord('q'):
+            self._outline_visible = False
+            return
+        if ch == curses.KEY_UP or ch == ord('k'):
+            self._outline_cursor = max(0, self._outline_cursor - 1)
+            return
+        if ch == curses.KEY_DOWN or ch == ord('j'):
+            self._outline_cursor = min(len(self._outline_items) - 1, self._outline_cursor + 1)
+            return
+        if ch in (curses.KEY_ENTER, 10, 13):
+            if self._outline_items:
+                _, _, lineno = self._outline_items[self._outline_cursor]
+                self._outline_visible = False
+                self.jumplist_push()
+                self.cy = lineno
+                self.cx = 0
+                self.message = f"Jumped to line {lineno + 1}"
+            return
+
+    # ── Recent Files Popup ─────────────────────────────────────────
+
+    def _show_recent_files(self):
+        """Show recent files in a selection overlay."""
+        if not self.recent_files:
+            self.message = "No recent files"
+            return
+        # Reuse grep results UI
+        self._grep_results = []
+        for f in self.recent_files:
+            name = os.path.basename(f)
+            self._grep_results.append((f, 0, name))
+        self._grep_visible = True
+        self._grep_cursor = 0
+        self.message = f"{len(self.recent_files)} recent files"
+
+    # ── Surround Editing ───────────────────────────────────────────
+
+    def surround_change(self, old_char, new_char):
+        """Change surrounding pair (cs<old><new>)."""
+        pairs = {
+            '(': ('(', ')'), ')': ('(', ')'),
+            '[': ('[', ']'), ']': ('[', ']'),
+            '{': ('{', '}'), '}': ('{', '}'),
+            '<': ('<', '>'), '>': ('<', '>'),
+            '"': ('"', '"'), "'": ("'", "'"), '`': ('`', '`'),
+        }
+        if old_char not in pairs or new_char not in pairs:
+            self.message = f"Unknown surround char: {old_char} or {new_char}"
+            return
+        open_old, close_old = pairs[old_char]
+        open_new, close_new = pairs[new_char]
+        line = self.lines[self.cy]
+        # Find the old pair around cursor
+        left = line.rfind(open_old, 0, self.cx + 1)
+        right = line.find(close_old, self.cx)
+        if left < 0 or right < 0 or left >= right:
+            self.message = f"No surrounding {old_char} found"
+            return
+        self.snapshot()
+        # Replace right first (so indices don't shift)
+        self.lines[self.cy] = line[:right] + close_new + line[right + 1:]
+        self.lines[self.cy] = self.lines[self.cy][:left] + open_new + self.lines[self.cy][left + 1:]
+        self.mark_dirty()
+        self.message = f"Changed {old_char} → {new_char}"
+
+    def surround_delete(self, char):
+        """Delete surrounding pair (ds<char>)."""
+        pairs = {
+            '(': ('(', ')'), ')': ('(', ')'),
+            '[': ('[', ']'), ']': ('[', ']'),
+            '{': ('{', '}'), '}': ('{', '}'),
+            '<': ('<', '>'), '>': ('<', '>'),
+            '"': ('"', '"'), "'": ("'", "'"), '`': ('`', '`'),
+        }
+        if char not in pairs:
+            self.message = f"Unknown surround char: {char}"
+            return
+        open_ch, close_ch = pairs[char]
+        line = self.lines[self.cy]
+        left = line.rfind(open_ch, 0, self.cx + 1)
+        right = line.find(close_ch, self.cx)
+        if left < 0 or right < 0 or left >= right:
+            self.message = f"No surrounding {char} found"
+            return
+        self.snapshot()
+        self.lines[self.cy] = line[:right] + line[right + 1:]
+        self.lines[self.cy] = self.lines[self.cy][:left] + self.lines[self.cy][left + 1:]
+        self.cx = max(0, self.cx - 1)
+        self.mark_dirty()
+        self.message = f"Deleted surrounding {char}"
+
+    def surround_add(self, char):
+        """Add surround around visual selection (ys / S in visual)."""
+        pairs = {
+            '(': ('(', ')'), ')': ('(', ')'),
+            '[': ('[', ']'), ']': ('[', ']'),
+            '{': ('{', '}'), '}': ('{', '}'),
+            '<': ('<', '>'), '>': ('<', '>'),
+            '"': ('"', '"'), "'": ("'", "'"), '`': ('`', '`'),
+        }
+        if char not in pairs:
+            self.message = f"Unknown surround char: {char}"
+            return
+        if not self.selection:
+            self.message = "No selection for surround"
+            return
+        open_ch, close_ch = pairs[char]
+        sy, sx = self.selection
+        ey, ex = self.cy, self.cx
+        if (sy, sx) > (ey, ex):
+            sy, sx, ey, ex = ey, ex, sy, sx
+        self.snapshot()
+        # Insert close first
+        line_e = self.lines[ey]
+        self.lines[ey] = line_e[:ex] + close_ch + line_e[ex:]
+        # Insert open
+        line_s = self.lines[sy]
+        self.lines[sy] = line_s[:sx] + open_ch + line_s[sx:]
+        self.selection = None
+        self.mark_dirty()
+        self.message = f"Surrounded with {open_ch}{close_ch}"
+
+    # ── Sort Lines Utility ─────────────────────────────────────────
+
+    def _sort_lines(self):
+        """Sort all lines (or selection) alphabetically."""
+        self.snapshot()
+        if self.selection:
+            sy, _ = self.selection
+            ey = self.cy
+            if sy > ey:
+                sy, ey = ey, sy
+            self.lines[sy:ey + 1] = sorted(self.lines[sy:ey + 1])
+            self.selection = None
+        else:
+            self.lines.sort()
+        self.mark_dirty()
+        self.message = "Lines sorted"
+
     def draw_lsp_diagnostics_gutter(self, stdscr, line_idx, gutter_x, y):
         """Draw LSP diagnostic markers in the gutter."""
         for dline, dcol, severity, dmsg in self.lsp_diagnostics:
@@ -4358,6 +6276,7 @@ class Editor:
             self.cy = 0
             self.detect_syntax()
             self.emit("buffer_open", filepath=filepath)
+            self._add_recent_file(filepath)
             self.message = f"Opened buffer: {filepath}"
         except Exception as e:
             self.message = f"Error opening buffer: {e}"

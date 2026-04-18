@@ -1,6 +1,6 @@
 # EVim
 
-A modal CLI text editor inspired by Vim, built with Python and curses. 57 languages, 24 themes, built-in LSP client, file explorer, minimap, terminal, and plugin system.
+A modal CLI text editor inspired by Vim, built with Python and curses. 57 languages, 24 themes, built-in LSP client, file explorer, minimap, terminal, and plugin system — with Emacs-style IDE features.
 https://github.com/tortr-rs/evim-plugins for my official plugins!
 ![Python](https://img.shields.io/badge/Python-3.x-blue)
 ![License](https://img.shields.io/badge/License-BSD--3--Clause-green)
@@ -19,9 +19,17 @@ https://github.com/tortr-rs/evim-plugins for my official plugins!
 - **Git Gutter** — Shows added/modified/deleted lines
 - **Fuzzy Finder** — Quick file navigation (`Ctrl+p`)
 - **Macros, Marks, Registers** — Full Vim-style text manipulation
-- **Mouse Support** — Click, drag, double-click word select, scroll
+- **Mouse Support** — Click, drag, double/triple-click, scroll, right-click context menu, clickable tab bar & minimap
 - **Smart Editing** — Auto-pairs, auto-indent, dot-repeat, snippets
 - **Python-Scriptable Config** — `.evimrc` with full Python access
+- **Command Palette** — Emacs M-x style (`Ctrl+x` / `Alt+x`) with fuzzy filtering
+- **Kill Ring** — Multi-clipboard with rotate (`Ctrl+y` paste, `Alt+y` rotate)
+- **Incremental Search** — Live match highlighting as you type
+- **Code Folding** — `za`/`zo`/`zc`/`zM`/`zR` fold commands
+- **Project Grep** — `:grep` with rg/grep fallback and interactive results
+- **Symbol Outline** — `:outline` / `Alt+o` for function/class jump
+- **Recent Files** — `:recent` with persistent history
+- **Surround Editing** — `cs`/`ds`/`S` to change, delete, add surrounds
 
 ## Installation
 
@@ -69,8 +77,18 @@ evim myfile.py
 | `Ctrl+s` | Quick save |
 | `Ctrl+/` | Toggle comment |
 | `F5` | Run file |
+| `F10` | Settings menu |
 | `q<reg>` `@<reg>` | Record / play macro |
 | `m<char>` `'<char>` | Set / go to mark |
+| `Ctrl+x` | Command palette (M-x) |
+| `Ctrl+y` | Kill ring paste |
+| `Alt+y` | Kill ring rotate |
+| `Alt+o` | Symbol outline |
+| `za` `zo` `zc` | Fold toggle/open/close |
+| `zM` `zR` | Fold all / unfold all |
+| `cs<old><new>` | Change surround pair |
+| `ds<char>` | Delete surround |
+| `S<char>` | Surround selection (visual) |
 
 ### Insert Mode
 
@@ -96,6 +114,32 @@ evim myfile.py
 | `:run` | Run current file |
 | `:help` | Show help |
 | `:! <cmd>` | Shell command |
+| `:grep <pattern>` | Project-wide search |
+| `:outline` | Symbol outline |
+| `:recent` | Recent files |
+| `:palette` | Command palette |
+| `:fold` `:foldall` | Toggle fold / fold all |
+| `:unfoldall` | Unfold all |
+| `:sort` | Sort lines |
+| `:killring` | Show kill ring |
+| `:menu` | Settings menu |
+| `:zen` | Zen mode (plugin) |
+| `:lorem [n]` | Lorem ipsum (plugin) |
+
+## Mouse
+
+| Action | Effect |
+|--------|--------|
+| Click | Position cursor |
+| Double-click | Select word |
+| Triple-click | Select line |
+| Drag | Visual selection |
+| Right-click | Context menu |
+| Scroll wheel | Scroll up/down |
+| Click tab bar | Switch buffer |
+| Click minimap | Jump to position |
+| Click mode indicator | Toggle insert/normal |
+| Click ▶ Run | Run file |
 
 ## Themes
 
