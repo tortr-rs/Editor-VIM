@@ -145,6 +145,12 @@ class Editor:
             self.buffers[self.filepath] = self.lines[:]
             self.buffer_order = [self.filepath]
             self.current_buffer_idx = 0
+        else:
+            # Unnamed buffer — usable without a file path
+            self.buffers["[No Name]"] = self.lines[:]
+            self.buffer_order = ["[No Name]"]
+            self.current_buffer_idx = 0
+            self.message = "EVim - [No Name] (use :w <filename> to save)"
         self.load_config()
         self.config_loading = False
 
@@ -2512,7 +2518,18 @@ class Editor:
         # write
         if cmd in ("w", "write"):
             if rest:
+                old_name = self.filepath
                 self.filepath = rest
+                self.filetype = Path(rest).suffix.lower()
+                self.detect_syntax()
+                # Update buffer tracking
+                buf_key = old_name or "[No Name]"
+                if buf_key in self.buffers:
+                    del self.buffers[buf_key]
+                if buf_key in self.buffer_order:
+                    idx = self.buffer_order.index(buf_key)
+                    self.buffer_order[idx] = rest
+                self.buffers[rest] = self.lines[:]
             self.write_file()
             return
 
@@ -2527,6 +2544,13 @@ class Editor:
             self.should_exit = True
             return
         if cmd == "wq":
+            if rest:
+                self.filepath = rest
+                self.filetype = Path(rest).suffix.lower()
+                self.detect_syntax()
+            if not self.filepath:
+                self.message = "No filename. Use :wq <filename> or :w <filename> first."
+                return
             self.write_file()
             self.should_exit = True
             return
