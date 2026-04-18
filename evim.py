@@ -9,6 +9,7 @@ import re
 import select
 import struct
 import subprocess
+import sys
 import termios
 import threading
 import time
@@ -4393,20 +4394,26 @@ class Editor:
         buf_list = ", ".join(self.buffer_order)
         self.message = f"Buffers: {buf_list}"
 
+def print_usage():
+    print("Usage: evim [file]")
+    print("  file    File to open (optional)")
+    print("\nKeyboard shortcuts:")
+    print("  :help   Show full help inside editor")
+    print("  :lsp    Start language server")
+    print("  :q      Quit")
+    sys.exit(0)
 
 def main():
     import sys
     args = sys.argv[1:]
     filepath = None
+    if not args:
+        print("you need to provide a file to open, or use -h for help")
+        print_usage()
+
     for arg in args:
         if arg in ("-h", "--help"):
-            print("Usage: evim [file]")
-            print("  file    File to open (optional)")
-            print("\nKeyboard shortcuts:")
-            print("  :help   Show full help inside editor")
-            print("  :lsp    Start language server")
-            print("  :q      Quit")
-            sys.exit(0)
+            print_usage()
         elif arg in ("-v", "--version"):
             print("EVim 1.0")
             sys.exit(0)
