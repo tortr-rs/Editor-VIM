@@ -25,7 +25,6 @@ cat > %{buildroot}%{_bindir}/evim <<'EOF'
 exec python3 %{_libdir}/evim/evim.py "$@"
 EOF
 chmod 755 %{buildroot}%{_bindir}/evim
-install -Dm644 LICENSE %{buildroot}%{_licensedir}/%{name}/LICENSE
 
 %files
 %license LICENSE
@@ -34,5 +33,5 @@ install -Dm644 LICENSE %{buildroot}%{_licensedir}/%{name}/LICENSE
 %{_bindir}/evim
 
 %changelog
-* Sat Apr 19 2026 tortr-rs - 1.0.0-1
+* Sun Apr 19 2026 tortr-rs - 1.0.0-1
 - Initial package

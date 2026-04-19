@@ -1,0 +1,12 @@
+pkgbase = evim-editor
+	pkgdesc = Modal CLI text editor with Vim keybindings, LSP, plugins, and 24 themes
+	pkgver = 1.0.0
+	pkgrel = 1
+	url = https://github.com/tortr-rs/Editor-VIM
+	arch = any
+	license = MIT
+	depends = python
+	source = evim-editor-1.0.0.tar.gz::https://github.com/tortr-rs/Editor-VIM/archive/v1.0.0.tar.gz
+	sha256sums = SKIP
+
+pkgname = evim-editor

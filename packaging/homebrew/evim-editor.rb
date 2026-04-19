@@ -2,6 +2,7 @@ class EvimEditor < Formula
   desc "Modal CLI text editor with Vim keybindings"
   homepage "https://github.com/tortr-rs/Editor-VIM"
   url "https://github.com/tortr-rs/Editor-VIM/archive/v1.0.0.tar.gz"
+  sha256 "80667468d7ab7a7f41a21343444368aec09b34ec825012e5c67f6ec4303279ef"
   license "MIT"
 
   depends_on "python@3"
