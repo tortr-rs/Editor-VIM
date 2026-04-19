@@ -1,0 +1,18 @@
+pkgname=evim-editor
+pkgver=1.0.0
+pkgrel=0
+pkgdesc="Modal CLI text editor with Vim keybindings"
+url="https://github.com/tortr-rs/Editor-VIM"
+arch="noarch"
+license="MIT"
+depends="python3"
+source="$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz"
+
+package() {
+    cd "Editor-VIM-$pkgver"
+    install -Dm755 evim.py "$pkgdir"/usr/lib/evim/evim.py
+    mkdir -p "$pkgdir"/usr/bin
+    printf '#!/bin/sh\nexec python3 /usr/lib/evim/evim.py "$@"\n' > "$pkgdir"/usr/bin/evim
+    chmod 755 "$pkgdir"/usr/bin/evim
+    install -Dm644 LICENSE "$pkgdir"/usr/share/licenses/$pkgname/LICENSE
+}

@@ -1,32 +1,28 @@
 # zen_mode.py — Distraction-free writing mode via :zen
 
-_original_opts = {}
+_ZEN_OPTS = ('number', 'relativenumber', 'cursorline', 'indent_guides')
 
 
 def _toggle_zen(editor):
     if getattr(editor, '_zen_active', False):
-        # Restore
-        for k, v in _original_opts.items():
+        for k, v in editor._zen_saved.items():
             editor.options[k] = v
         editor._zen_active = False
         editor.message = "[zen] Zen mode off"
     else:
-        # Save and set minimal options
-        _original_opts.clear()
-        for k in ('number', 'relativenumber', 'cursorline', 'indent_guides'):
-            _original_opts[k] = editor.options.get(k, False)
+        editor._zen_saved = {k: editor.options.get(k, False) for k in _ZEN_OPTS}
+        for k in _ZEN_OPTS:
             editor.options[k] = False
         editor._zen_active = True
-        # Hide explorer and minimap if visible
-        if getattr(editor, 'show_explorer', False):
-            editor.show_explorer = False
-        if getattr(editor, 'show_minimap', False):
-            editor.show_minimap = False
-        editor.message = "[zen] Zen mode on — distraction-free writing"
+        for attr in ('show_explorer', 'show_minimap'):
+            if getattr(editor, attr, False):
+                setattr(editor, attr, False)
+        editor.message = "[zen] Zen mode on"
 
 
 def setup(editor):
     editor._zen_active = False
+    editor._zen_saved = {}
     editor._zen_original_run_ex = editor.run_ex
 
     def patched_run_ex(cmd):
@@ -36,7 +32,6 @@ def setup(editor):
         return editor._zen_original_run_ex(cmd)
 
     editor.run_ex = patched_run_ex
-    editor.message = "[zen] Zen mode available — use :zen to toggle"
 
 
 def teardown(editor):
@@ -45,8 +40,9 @@ def teardown(editor):
     if hasattr(editor, '_zen_original_run_ex'):
         editor.run_ex = editor._zen_original_run_ex
         del editor._zen_original_run_ex
-    if hasattr(editor, '_zen_active'):
-        del editor._zen_active
+    for attr in ('_zen_active', '_zen_saved'):
+        if hasattr(editor, attr):
+            delattr(editor, attr)
 
 
 editor.plugin_register(

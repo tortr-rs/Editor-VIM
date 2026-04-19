@@ -1,0 +1,31 @@
+name: evim-editor
+base: core22
+version: '1.0.0'
+summary: Modal CLI text editor with Vim keybindings
+description: |
+  EVim is a feature-rich terminal text editor with Vim-style modal editing,
+  LSP support, plugin system, 24 color themes, syntax highlighting for 55+
+  languages, file explorer, integrated terminal, and more.
+grade: stable
+confinement: classic
+
+apps:
+  evim:
+    command: bin/evim
+
+parts:
+  evim:
+    plugin: dump
+    source: .
+    organize:
+      evim.py: lib/evim/evim.py
+    override-build: |
+      craftctl default
+      mkdir -p $CRAFT_PART_INSTALL/bin
+      cat > $CRAFT_PART_INSTALL/bin/evim <<'EOF'
+      #!/bin/sh
+      exec python3 $SNAP/lib/evim/evim.py "$@"
+      EOF
+      chmod +x $CRAFT_PART_INSTALL/bin/evim
+    stage-packages:
+      - python3

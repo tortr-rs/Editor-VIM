@@ -1,53 +1,44 @@
 # autosave.py — Auto-save files on a timer after edits
-# Saves the current file every N seconds if modified.
 
 import threading
 
-_timer = None
-_dirty = False
-_interval = 30  # seconds
+_INTERVAL = 30
 
 
 def _auto_save(editor):
-    global _dirty, _timer
-    if _dirty and editor.filepath and hasattr(editor, 'write_file'):
+    if getattr(editor, '_autosave_dirty', False) and editor.filepath and hasattr(editor, 'write_file'):
         try:
             editor.write_file()
             editor.message = f"[autosave] Saved {editor.filepath}"
-            _dirty = False
+            editor._autosave_dirty = False
         except Exception:
             pass
-    _timer = threading.Timer(_interval, _auto_save, args=[editor])
-    _timer.daemon = True
-    _timer.start()
+    t = threading.Timer(_INTERVAL, _auto_save, args=[editor])
+    t.daemon = True
+    t.start()
+    editor._autosave_timer = t
 
 
 def _mark_dirty(editor, **kwargs):
-    global _dirty
-    _dirty = True
+    editor._autosave_dirty = True
+
+
+def _clear_dirty(editor, **kwargs):
+    editor._autosave_dirty = False
 
 
 def setup(editor):
-    editor.on("after_save", _on_save)
+    editor._autosave_dirty = False
+    editor.on("after_save", _clear_dirty)
     editor.on("buffer_open", _mark_dirty)
-    global _timer
-    _timer = threading.Timer(_interval, _auto_save, args=[editor])
-    _timer.daemon = True
-    _timer.start()
-    editor.message = f"[autosave] Enabled ({_interval}s interval)"
-
-
-def _on_save(editor, **kwargs):
-    global _dirty
-    _dirty = False
+    _auto_save(editor)
 
 
 def teardown(editor):
-    global _timer
-    if _timer:
-        _timer.cancel()
-        _timer = None
-    editor.off("after_save", _on_save)
+    t = getattr(editor, '_autosave_timer', None)
+    if t:
+        t.cancel()
+    editor.off("after_save", _clear_dirty)
     editor.off("buffer_open", _mark_dirty)
 
 

@@ -1,0 +1,35 @@
+{
+    "app-id": "io.github.tortr-rs.evim",
+    "runtime": "org.freedesktop.Platform",
+    "runtime-version": "23.08",
+    "sdk": "org.freedesktop.Sdk",
+    "command": "evim",
+    "finish-args": [
+        "--filesystem=host",
+        "--filesystem=home"
+    ],
+    "modules": [
+        {
+            "name": "evim",
+            "buildsystem": "simple",
+            "build-commands": [
+                "install -Dm755 evim.py /app/lib/evim/evim.py",
+                "install -Dm755 evim-wrapper /app/bin/evim"
+            ],
+            "sources": [
+                {
+                    "type": "git",
+                    "url": "https://github.com/tortr-rs/Editor-VIM.git",
+                    "tag": "v1.0.0"
+                },
+                {
+                    "type": "script",
+                    "dest-filename": "evim-wrapper",
+                    "commands": [
+                        "exec python3 /app/lib/evim/evim.py \"$@\""
+                    ]
+                }
+            ]
+        }
+    ]
+}

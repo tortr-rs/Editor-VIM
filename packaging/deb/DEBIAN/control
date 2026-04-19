@@ -1,0 +1,12 @@
+Package: evim-editor
+Version: 1.0.0
+Section: editors
+Priority: optional
+Architecture: all
+Depends: python3 (>= 3.8)
+Maintainer: tortr-rs <https://github.com/tortr-rs>
+Description: Modal CLI text editor with Vim keybindings
+ EVim is a feature-rich terminal text editor with Vim-style modal editing,
+ LSP support, plugin system, 24 color themes, syntax highlighting for 55+
+ languages, file explorer, integrated terminal, and more.
+Homepage: https://github.com/tortr-rs/Editor-VIM

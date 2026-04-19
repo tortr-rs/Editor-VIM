@@ -9,8 +9,7 @@ def _update_count(editor, **kwargs):
 
 
 def setup(editor):
-    editor.on("after_save", _on_save)
-    # Register a custom command :wordcount
+    editor.on("after_save", _update_count)
     editor._wordcount_original_run_ex = editor.run_ex
 
     def patched_run_ex(cmd):
@@ -22,12 +21,8 @@ def setup(editor):
     editor.run_ex = patched_run_ex
 
 
-def _on_save(editor, **kwargs):
-    _update_count(editor)
-
-
 def teardown(editor):
-    editor.off("after_save", _on_save)
+    editor.off("after_save", _update_count)
     if hasattr(editor, '_wordcount_original_run_ex'):
         editor.run_ex = editor._wordcount_original_run_ex
         del editor._wordcount_original_run_ex

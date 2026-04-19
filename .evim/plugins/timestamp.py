@@ -1,6 +1,12 @@
-# timestamp.py — Insert current timestamp with :timestamp or :ts
+# timestamp.py — Insert current timestamp with :timestamp, :ts, or :date
 
 import datetime
+
+
+def _insert_at_cursor(editor, text):
+    line = editor.lines[editor.cy]
+    editor.lines[editor.cy] = line[:editor.cx] + text + line[editor.cx:]
+    editor.cx += len(text)
 
 
 def setup(editor):
@@ -10,16 +16,12 @@ def setup(editor):
         stripped = cmd.strip()
         if stripped in ("timestamp", "ts"):
             now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            line = editor.lines[editor.cy]
-            editor.lines[editor.cy] = line[:editor.cx] + now + line[editor.cx:]
-            editor.cx += len(now)
+            _insert_at_cursor(editor, now)
             editor.message = f"[timestamp] Inserted {now}"
             return
-        if stripped in ("date",):
+        if stripped == "date":
             today = datetime.datetime.now().strftime("%Y-%m-%d")
-            line = editor.lines[editor.cy]
-            editor.lines[editor.cy] = line[:editor.cx] + today + line[editor.cx:]
-            editor.cx += len(today)
+            _insert_at_cursor(editor, today)
             editor.message = f"[timestamp] Inserted {today}"
             return
         return editor._ts_original_run_ex(cmd)
