@@ -35,17 +35,70 @@ https://github.com/tortr-rs/evim-plugins for my official plugins!
 
 Requires Python 3 with `curses` (included on Linux/macOS).
 
+### Debian / Ubuntu (apt)
+
+```bash
+curl -fsSL https://tortr-rs.github.io/evim-repo/public.key | sudo gpg --dearmor -o /usr/share/keyrings/evim.gpg
+echo "deb [signed-by=/usr/share/keyrings/evim.gpg] https://tortr-rs.github.io/evim-repo stable main" | sudo tee /etc/apt/sources.list.d/evim.list
+sudo apt update && sudo apt install evim-editor
+```
+
+### Fedora / RHEL (dnf)
+
+```bash
+sudo tee /etc/yum.repos.d/evim.repo <<EOF
+[evim]
+name=EVim Editor Repository
+baseurl=https://tortr-rs.github.io/evim-repo/rpm
+enabled=1
+gpgcheck=1
+gpgkey=https://tortr-rs.github.io/evim-repo/public.key
+EOF
+sudo dnf install evim-editor
+```
+
+### openSUSE (zypper)
+
+```bash
+sudo zypper addrepo https://tortr-rs.github.io/evim-repo/rpm evim
+sudo zypper refresh && sudo zypper install evim-editor
+```
+
+### Arch Linux (pacman)
+
+```bash
+sudo pacman -U https://github.com/tortr-rs/Editor-VIM/releases/download/v1.0.0/evim-editor-1.0.0-1-any.pkg.tar.zst
+```
+
+### macOS (Homebrew)
+
+```bash
+brew tap tortr-rs/evim && brew install evim-editor
+```
+
+### Flatpak
+
+```bash
+# Download from GitHub Releases
+flatpak install evim-editor-1.0.0.flatpak
+```
+
+### pip
+
+```bash
+pip install evim-editor
+```
+
+### From source
+
 ```bash
 git clone https://github.com/tortr-rs/Editor-VIM.git
 cd Editor-VIM
-
-# Option 1: Run directly
 python3 evim.py [file]
 
-# Option 2: Install as a command
+# Or install as a command:
 chmod +x evim
 ln -s "$(pwd)/evim" ~/.local/bin/evim
-# Then use from anywhere:
 evim myfile.py
 ```
 
