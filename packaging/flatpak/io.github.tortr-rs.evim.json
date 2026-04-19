@@ -1,5 +1,5 @@
 {
-    "app-id": "io.github.tortr-rs.evim",
+    "app-id": "io.github.tortrrs.evim",
     "runtime": "org.freedesktop.Platform",
     "runtime-version": "23.08",
     "sdk": "org.freedesktop.Sdk",
