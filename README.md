@@ -94,12 +94,9 @@ pip install evim-editor
 ```bash
 git clone https://github.com/tortr-rs/Editor-VIM.git
 cd Editor-VIM
-python3 evim.py [file]
-
-# Or install as a command:
 chmod +x evim
 ln -s "$(pwd)/evim" ~/.local/bin/evim
-evim myfile.py
+#then run evim 
 ```
 
 ## Keybindings

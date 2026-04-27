@@ -30,3 +30,4 @@ editor.options['explorer'] = True
 editor.options['minimal'] = False
 
 editor.message = 'Config Loaded'
+

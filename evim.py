@@ -2056,12 +2056,12 @@ class Editor:
             try:
                 _, mx, my, _, bstate = curses.getmouse()
                 height, width = stdscr.getmaxyx()
-                top = max(0, self.cy - height + 4)
+                tab_h = 1 if self.options.get("tabline") else 0
+                top = max(0, self.cy - height + 4 + tab_h)
                 has_nums = self.options.get("number") or self.options.get("relativenumber")
                 prefix_w = (2 if self.git_diff_lines else 0) + (5 if has_nums else 0)
                 scroll_left = self.scroll_left if not self.options.get("wrap") else 0
                 now = time.time()
-                tab_h = 1 if self.options.get("tabline") else 0
                 # ── Right-click context menu ──
                 if bstate & (curses.BUTTON3_PRESSED | curses.BUTTON3_CLICKED):
                     self._show_context_menu(stdscr, mx, my)
@@ -2191,8 +2191,8 @@ class Editor:
                     self.scroll_half_down(height)
                     return
                 # Click / drag in the editor text area
-                if my < height - 2:
-                    target_line = top + my
+                if my >= tab_h and my < height - 2:
+                    target_line = top + my - tab_h
                     editor_left_off = min(self.explorer_width, width // 3) if self.explorer_visible else 0
                     target_col = max(0, mx - prefix_w - editor_left_off + scroll_left)
                     if 0 <= target_line < len(self.lines):
@@ -5727,14 +5727,15 @@ class Editor:
         """Draw LSP completion popup near the cursor."""
         if not self.lsp_completion_active or not self.lsp_completions:
             return
-        top = max(0, self.cy - (max(0, self.cy - height + 4)))
+        tab_h = 1 if self.options.get("tabline") else 0
+        top = max(0, self.cy - (max(0, self.cy - height + 4 + tab_h)))
         has_nums = self.options.get("number") or self.options.get("relativenumber")
         prefix_w = (2 if self.git_diff_lines else 0) + (5 if has_nums else 0)
         editor_left = 0
         if self.explorer_visible:
             editor_left = min(self.explorer_width, width // 3)
         popup_x = self.cx + prefix_w + editor_left + 1
-        popup_y = top + 1
+        popup_y = top + tab_h + 1
         max_items = min(len(self.lsp_completions), 10, height - popup_y - 3)
         if max_items <= 0:
             return
@@ -6152,10 +6153,10 @@ class Editor:
         if self.mode == "terminal" and self.term_scroll == 0:
             last_line = self.term_lines[-1] if self.term_lines else ""
             cursor_col = min(self.term_col, content_w - 1)
-            # Cursor row: position within visible area
+            # Cursor row: position within visible area (panel_y+1 is first content row)
             n_visible = min(len(self.term_lines), content_h)
-            cursor_row = panel_y + n_visible
-            if cursor_row < height - 2:
+            cursor_row = panel_y + 1 + n_visible - 1
+            if cursor_row < height - 2 and cursor_row >= panel_y + 1:
                 curses.setsyx(cursor_row, panel_x + 1 + cursor_col)
 
     def find_pattern(self, pattern, direction=1):
