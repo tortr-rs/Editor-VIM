@@ -2,6 +2,7 @@
 
 A modal CLI text editor inspired by Vim, built with Python and curses. 57 languages, 24 themes, built-in LSP client, file explorer, minimap, terminal, and plugin system — with Emacs-style IDE features.
 https://github.com/tortr-rs/evim-plugins for my official plugins!
+and visit https://editor-vim.netlify.app/ for the official website
 ![Python](https://img.shields.io/badge/Python-3.x-blue)
 ![License](https://img.shields.io/badge/License-BSD--3--Clause-green)
 
