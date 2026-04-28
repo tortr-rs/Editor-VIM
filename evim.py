@@ -1944,7 +1944,7 @@ class Editor:
         if self.show_welcome:
             lines = [
                 "Welcome to EVim",
-                "Uganda Fund Edition",
+                "1.0.0",
                 "",
                 "Normal mode commands:",
                 "  h/j/k/l  - move",
