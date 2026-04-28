@@ -19,4 +19,4 @@ packaging/aur/*.tar.gz
 flatpak-repo/
 build-dir/
 .flatpak-builder/
-packaging/ # Ignore the packaging directory as it contains build artifacts and temporary files
+packaging/ 

@@ -197,7 +197,29 @@ class Editor:
         self._outline_items = []
         self._outline_cursor = 0
         # Multi-cursor
-        self.cursors = []
+        self.cursors = []  # [(cy, cx), ...] — extra cursors beyond the primary
+        # Visual block mode
+        self.selection_type = "char"   # "char" | "line" | "block"
+        # Splits
+        self.splits = []        # [{"filepath": str, "lines": list, "cy": int, "cx": int,
+                                #   "scroll_top": int, "scroll_left": int, "direction": "h"|"v"}, ...]
+        self.active_split = 0   # which split is focused (0 = main editor)
+        # LSP extras
+        self.lsp_inlay_hints = {}     # {line_no: [(col, label), ...]}
+        self.lsp_action_items = []    # [(title, command, args), ...]
+        self._diag_panel_visible = False
+        self._diag_panel_cursor = 0
+        # Session
+        self._session_path = Path.home() / ".config" / "evim" / "session.json"
+        # File watcher
+        self._file_mtimes = {}   # {filepath: mtime}
+        self._watcher_thread = None
+        # Breadcrumbs
+        self._breadcrumb = ""    # e.g. "MyClass > my_method"
+        # Git
+        self._git_status_lines = []
+        self._git_status_visible = False
+        self._git_status_cursor = 0
         # Surround pending
         self._surround_pending = None
         self._load_recent_files()
@@ -214,6 +236,11 @@ class Editor:
             self.message = "EVim - [No Name] (use :w <filename> to save)"
         self.load_config()
         self.config_loading = False
+        # Start file watcher background thread
+        self._start_file_watcher()
+        # Auto-restore session if no file was specified
+        if not self.filepath:
+            self._session_restore_silent()
 
     def read_file(self):
         if not self.filepath:
@@ -1753,6 +1780,40 @@ class Editor:
                     except curses.error:
                         pass
 
+            # ── Visual block selection highlight ──
+            if self.mode == "visual" and self.selection_type == "block" and self.selection is not None:
+                rect = self._block_selection_rect()
+                if rect:
+                    top_b, bot_b, left_b, right_b = rect
+                    if top_b <= lineno <= bot_b:
+                        prefix_len = len(full_prefix)
+                        hl_start = x_off + prefix_len + left_b - scroll_left
+                        hl_len = right_b - left_b + 1
+                        if hl_start < x_off + editor_w and hl_start + hl_len > x_off:
+                            hl_start = max(hl_start, x_off + prefix_len)
+                            hl_len = min(hl_len, x_off + editor_w - hl_start - 1)
+                            if hl_len > 0:
+                                try:
+                                    stdscr.chgat(row, hl_start, hl_len, curses.A_REVERSE)
+                                except curses.error:
+                                    pass
+
+            # ── Multi-cursor secondary cursor markers ──
+            if self.cursors:
+                prefix_len = len(full_prefix)
+                for (mcy, mcx) in self.cursors:
+                    if mcy == lineno:
+                        mc_x = x_off + prefix_len + mcx - scroll_left
+                        if x_off + prefix_len <= mc_x < x_off + editor_w - 1:
+                            try:
+                                stdscr.chgat(row, mc_x, 1, curses.A_REVERSE | curses.A_BOLD)
+                            except curses.error:
+                                pass
+
+            # ── LSP inlay hints ──
+            if self.options.get("inlay_hints", True):
+                self.draw_inlay_hints(stdscr, row, lineno, len(full_prefix), x_off, editor_w)
+
         # Fill empty rows below file content with tilde markers
         ln_attr = getattr(self, 'color_lineno', bg)
         for idx in range(num_file_lines + tab_h, height - 2):
@@ -1765,9 +1826,14 @@ class Editor:
         ft = self.syntax_language or "plain"
         linecol = f"Ln {self.cy + 1}/{len(self.lines)}, Col {self.cx + 1}"
         color_info = f"{self._color_depth}c" if self._color_depth != 8 else ""
-        left_status = f" {self.mode.upper()} | {self.filepath or '[no file]'} {dirty_marker}"
+        # Update breadcrumb from outline
+        self.update_breadcrumb()
+        crumb = f"  {self._breadcrumb}" if self._breadcrumb else ""
+        # Multi-cursor indicator
+        mc_ind = f" +{len(self.cursors)}cur" if self.cursors else ""
+        left_status = f" {self.mode.upper()} | {self.filepath or '[no file]'} {dirty_marker}{mc_ind}"
         run_btn = " \u25b6 Run " if self.filepath else ""
-        right_status = f"{ft} {color_info}| {linecol} "
+        right_status = f"{ft} {color_info}| {linecol}{crumb} "
         mid = self.message
         gap = width - 1 - len(left_status) - len(run_btn) - len(right_status)
         if gap > len(mid) + 2:
@@ -1823,6 +1889,15 @@ class Editor:
         # Draw terminal panel if visible
         if self.term_visible:
             self.draw_terminal_panel(stdscr)
+        # Draw diagnostics panel if visible
+        if self._diag_panel_visible:
+            self.draw_diagnostics_panel(stdscr, height, width)
+        # Draw git output panel if visible
+        if self._git_status_visible:
+            self.draw_git_panel(stdscr, height, width)
+        # Draw split pane indicator
+        if self.splits:
+            self.draw_split_indicators(stdscr, height, width)
         # Draw LSP completion popup
         if self.lsp_completion_active:
             self.draw_lsp_completion_popup(stdscr, height, width)
@@ -2190,6 +2265,18 @@ class Editor:
                 if bstate & (curses.BUTTON5_PRESSED if hasattr(curses, 'BUTTON5_PRESSED') else 0):
                     self.scroll_half_down(height)
                     return
+                # Alt+Click — add/remove multi-cursor
+                if bstate & curses.BUTTON1_PRESSED and (bstate & curses.BUTTON_ALT if hasattr(curses, 'BUTTON_ALT') else False):
+                    tab_h = 1 if self.options.get("tabline") else 0
+                    top = max(0, self.cy - height + 4 + tab_h)
+                    has_nums = self.options.get("number") or self.options.get("relativenumber")
+                    prefix_w = (2 if self.git_diff_lines else 0) + (5 if has_nums else 0)
+                    editor_left = min(self.explorer_width, width // 3) if self.explorer_visible else 0
+                    target_line = top + my - tab_h
+                    target_col = max(0, mx - editor_left - prefix_w + self.scroll_left)
+                    if 0 <= target_line < len(self.lines):
+                        self.multicursor_add(target_line, target_col)
+                    return
                 # Click / drag in the editor text area
                 if my >= tab_h and my < height - 2:
                     target_line = top + my - tab_h
@@ -2296,6 +2383,14 @@ class Editor:
         # Explorer mode input handling
         if self.mode == "explorer":
             self.explorer_handle_key(ch)
+            return
+        # Diagnostics panel key handling (overrides normal when panel visible)
+        if self._diag_panel_visible and self.mode == "normal":
+            self.handle_diagnostics_panel_key(ch)
+            return
+        # Git panel key handling
+        if self._git_status_visible and self.mode == "normal":
+            self.handle_git_panel_key(ch)
             return
         # Terminal mode input handling — keystrokes go directly to pty
         if self.mode == "terminal":
@@ -2494,10 +2589,16 @@ class Editor:
             # failed combo, continue processing key normally
         if self.selection and key == "d":
             self.snapshot()
-            self.delete_selection()
+            if self.selection_type == "block":
+                self.delete_block_selection()
+            else:
+                self.delete_selection()
             return
         if self.selection and key == "y":
-            self.yank_selection()
+            if self.selection_type == "block":
+                self.yank_block_selection()
+            else:
+                self.yank_selection()
             return
         if key == "d":
             self.pending_normal = "d"
@@ -2858,10 +2959,28 @@ class Editor:
                 # Alt+o - symbol outline
                 self._build_outline()
                 return
+            elif next_ch in (curses.KEY_ENTER, 10, 13):
+                # Alt+Enter - LSP code actions
+                self.lsp_code_action()
+                return
             elif next_ch == -1:
                 # Just ESC, no follow-up - do nothing in normal mode
                 return
             # Unknown Alt combo - ignore
+            return
+
+        # Ctrl+v — visual block mode
+        if ch == 22:
+            self.toggle_visual_block()
+            return
+
+        # Ctrl+w — split pane commands
+        if ch == 23:
+            stdscr.timeout(300)
+            next_ch = stdscr.getch()
+            stdscr.timeout(100)
+            if next_ch >= 0:
+                self._handle_split_key(stdscr, next_ch)
             return
 
         # / and ? for search
@@ -3462,6 +3581,66 @@ class Editor:
                 self.message = " | ".join(entries)
             else:
                 self.message = "Kill ring empty"
+            return
+
+        # ── Session ──
+        if cmd in ("mksession", "mks", "savesession"):
+            self.session_save()
+            return
+        if cmd in ("restoresession", "ressession", "loadsession"):
+            self.session_restore()
+            return
+
+        # ── Diagnostics panel ──
+        if cmd in ("diagnostics", "diag"):
+            self.toggle_diagnostics_panel()
+            return
+
+        # ── Git integration ──
+        if cmd == "git":
+            subcmd = rest.strip()
+            if not subcmd:
+                self.message = "Usage: :git <status|diff|log|add|commit|push|pull|branch>"
+                return
+            parts2 = subcmd.split(None, 1)
+            args2 = parts2[1] if len(parts2) > 1 else ""
+            self.git_command(parts2[0], args2)
+            return
+
+        # ── Remote editing ──
+        if cmd in ("scp", "remote"):
+            if rest:
+                self.open_remote(rest.strip())
+            else:
+                self.message = "Usage: :scp user@host:/path/to/file"
+            return
+        if cmd in ("wpush", "pushremote"):
+            self.push_remote()
+            return
+
+        # ── Multi-cursor ──
+        if cmd in ("clearcursors", "nocursor"):
+            self.multicursor_clear()
+            return
+
+        # ── Inlay hints ──
+        if cmd in ("inlayhints", "inlay"):
+            self.options["inlay_hints"] = not self.options.get("inlay_hints", True)
+            state = "ON" if self.options["inlay_hints"] else "OFF"
+            self.message = f"Inlay hints: {state}"
+            if self.options["inlay_hints"]:
+                self.lsp_request_inlay_hints()
+            return
+
+        # ── Split panes ──
+        if cmd in ("vsplit", "vsp"):
+            self.split_vertical()
+            return
+        if cmd in ("split", "sp"):
+            self.split_horizontal()
+            return
+        if cmd == "close":
+            self.split_close()
             return
 
         self.message = f"Unknown command: {cmd}"
@@ -4121,6 +4300,8 @@ class Editor:
                         "hover": {"contentFormat": ["plaintext"]},
                         "publishDiagnostics": {"relatedInformation": True},
                         "definition": {},
+                        "codeAction": {"dynamicRegistration": False},
+                        "inlayHint": {"dynamicRegistration": False},
                     }
                 },
             })
@@ -6259,6 +6440,10 @@ class Editor:
     def open_buffer(self, filepath):
         """Open a new file in a buffer"""
         try:
+            # Remote SSH: detect user@host:/path syntax
+            if "@" in filepath and ":" in filepath:
+                self.open_remote(filepath)
+                return
             # Save current buffer
             if self.filepath and self.filepath in self.buffers:
                 self.buffers[self.filepath] = self.lines[:]
@@ -6314,9 +6499,768 @@ class Editor:
         buf_list = ", ".join(self.buffer_order)
         self.message = f"Buffers: {buf_list}"
 
+    # ── Visual Block Mode ──────────────────────────────────────────────────────
+
+    def toggle_visual_block(self):
+        """Enter / toggle visual-block mode (Ctrl+v)."""
+        if self.selection_type == "block" and self.selection is not None:
+            self.selection = None
+            self.selection_type = "char"
+            self.message = "EVim - normal mode"
+        else:
+            self.selection = (self.cy, self.cx)
+            self.selection_type = "block"
+            self.mode = "visual"
+            self.message = "-- VISUAL BLOCK --"
+
+    def _block_selection_rect(self):
+        """Return (top_row, bot_row, left_col, right_col) for block selection."""
+        if self.selection is None or self.selection_type != "block":
+            return None
+        sy, sx = self.selection
+        ey, ex = self.cy, self.cx
+        top = min(sy, ey)
+        bot = max(sy, ey)
+        left = min(sx, ex)
+        right = max(sx, ex)
+        return top, bot, left, right
+
+    def delete_block_selection(self):
+        """Delete block-selected rectangle."""
+        rect = self._block_selection_rect()
+        if rect is None:
+            return
+        top, bot, left, right = rect
+        self.snapshot()
+        for r in range(top, min(bot + 1, len(self.lines))):
+            line = self.lines[r]
+            self.lines[r] = line[:left] + line[right + 1:]
+        self.cy = top
+        self.cx = left
+        self.selection = None
+        self.selection_type = "char"
+        self.mode = "normal"
+        self.dirty = True
+        self.message = "Block deleted"
+
+    def yank_block_selection(self):
+        """Yank block-selected rectangle to clipboard."""
+        rect = self._block_selection_rect()
+        if rect is None:
+            return
+        top, bot, left, right = rect
+        rows = []
+        for r in range(top, min(bot + 1, len(self.lines))):
+            line = self.lines[r]
+            rows.append(line[left:right + 1])
+        self.clipboard = "\n".join(rows)
+        self.kill_ring_push(self.clipboard)
+        self.selection = None
+        self.selection_type = "char"
+        self.mode = "normal"
+        self.message = f"Block yanked ({len(rows)} lines)"
+
+    def insert_block(self, text):
+        """Insert text at every row of the current block column."""
+        if self.selection is None or self.selection_type != "block":
+            return
+        sy, _ = self.selection
+        ey = self.cy
+        top = min(sy, ey)
+        bot = max(sy, ey)
+        col = min(self.selection[1], self.cx)
+        self.snapshot()
+        for r in range(top, min(bot + 1, len(self.lines))):
+            line = self.lines[r]
+            padded = line.ljust(col)
+            self.lines[r] = padded[:col] + text + padded[col:]
+        self.dirty = True
+
+    # ── Multi-cursor ──────────────────────────────────────────────────────────
+
+    def multicursor_add(self, cy, cx):
+        """Add an extra cursor (Alt+click)."""
+        pos = (cy, cx)
+        if pos in self.cursors:
+            self.cursors.remove(pos)
+        else:
+            self.cursors.append(pos)
+        self.message = f"{len(self.cursors) + 1} cursors"
+
+    def multicursor_clear(self):
+        """Clear all extra cursors."""
+        self.cursors.clear()
+        self.message = "Multi-cursor cleared"
+
+    def _apply_to_all_cursors(self, fn):
+        """Run fn(editor, cy, cx) on the primary cursor then all extra cursors."""
+        # Primary first
+        fn(self, self.cy, self.cx)
+        for i, (cy, cx) in enumerate(self.cursors):
+            saved_cy, saved_cx = self.cy, self.cx
+            self.cy, self.cx = cy, cx
+            fn(self, cy, cx)
+            self.cursors[i] = (self.cy, self.cx)
+            self.cy, self.cx = saved_cy, saved_cx
+
+    # ── Split Panes ───────────────────────────────────────────────────────────
+
+    def split_vertical(self):
+        """Split the current window vertically (Ctrl+w v)."""
+        pane = {
+            "filepath": self.filepath,
+            "lines": self.lines[:],
+            "cy": self.cy,
+            "cx": self.cx,
+            "scroll_top": self.scroll_top,
+            "scroll_left": self.scroll_left,
+            "direction": "v",
+        }
+        self.splits.append(pane)
+        self.active_split = len(self.splits)  # new pane is active
+        self.message = f"Vertical split ({len(self.splits) + 1} panes) — Ctrl+w w to switch"
+
+    def split_horizontal(self):
+        """Split the current window horizontally (Ctrl+w s)."""
+        pane = {
+            "filepath": self.filepath,
+            "lines": self.lines[:],
+            "cy": self.cy,
+            "cx": self.cx,
+            "scroll_top": self.scroll_top,
+            "scroll_left": self.scroll_left,
+            "direction": "h",
+        }
+        self.splits.append(pane)
+        self.active_split = len(self.splits)
+        self.message = f"Horizontal split ({len(self.splits) + 1} panes) — Ctrl+w w to switch"
+
+    def split_next(self):
+        """Focus the next pane (Ctrl+w w)."""
+        total = len(self.splits) + 1  # +1 for main editor
+        if total < 2:
+            self.message = "No splits open"
+            return
+        # Save current pane state
+        if self.active_split == 0:
+            pass  # main editor — nothing to save to splits
+        else:
+            idx = self.active_split - 1
+            self.splits[idx]["lines"] = self.lines[:]
+            self.splits[idx]["cy"] = self.cy
+            self.splits[idx]["cx"] = self.cx
+        # Advance
+        self.active_split = (self.active_split + 1) % total
+        self._split_load_active()
+
+    def split_close(self):
+        """Close the active split (Ctrl+w q)."""
+        if not self.splits:
+            self.message = "No splits to close"
+            return
+        if self.active_split == 0:
+            # Close last split instead
+            self.splits.pop()
+        else:
+            self.splits.pop(self.active_split - 1)
+        self.active_split = 0
+        self._split_load_active()
+        self.message = f"{len(self.splits) + 1} pane(s) remaining"
+
+    def _split_load_active(self):
+        """Load the active split's content into the main editor state."""
+        if self.active_split == 0:
+            # Main editor pane — restore from buffers
+            if self.filepath and self.filepath in self.buffers:
+                self.lines = self.buffers[self.filepath][:]
+            return
+        idx = self.active_split - 1
+        pane = self.splits[idx]
+        self.filepath = pane["filepath"]
+        self.lines = pane["lines"][:]
+        self.cy = pane["cy"]
+        self.cx = pane["cx"]
+        self.scroll_top = pane.get("scroll_top", 0)
+        self.scroll_left = pane.get("scroll_left", 0)
+        self.detect_syntax()
+
+    def _handle_split_key(self, stdscr, next_ch):
+        """Handle Ctrl+w <key> combos."""
+        if next_ch == ord('v'):
+            self.split_vertical()
+        elif next_ch == ord('s'):
+            self.split_horizontal()
+        elif next_ch in (ord('w'), ord('W')):
+            self.split_next()
+        elif next_ch in (ord('q'), ord('Q')):
+            self.split_close()
+        elif next_ch == ord('o'):
+            # Close all other splits
+            self.splits.clear()
+            self.active_split = 0
+            self.message = "All splits closed"
+        else:
+            self.message = f"Unknown split command: Ctrl+w {chr(next_ch) if 32 <= next_ch < 127 else '?'}"
+
+    def draw_split_indicators(self, stdscr, height, width):
+        """Draw minimal split pane borders/indicators in the status bar."""
+        if not self.splits:
+            return
+        total = len(self.splits) + 1
+        indicator = f" [{self.active_split + 1}/{total} panes] "
+        attr = getattr(self, 'color_status', curses.A_REVERSE)
+        try:
+            stdscr.addstr(height - 2, width - len(indicator) - 1, indicator, attr | curses.A_BOLD)
+        except curses.error:
+            pass
+
+    # ── LSP Code Actions ──────────────────────────────────────────────────────
+
+    def lsp_code_action(self):
+        """Request code actions from LSP at the current cursor (Alt+Enter)."""
+        if not self.lsp_enabled or not self.lsp_initialized or not self.filepath:
+            self.message = "LSP not active"
+            return
+        diag_here = [
+            {"range": {"start": {"line": dl, "character": dc}, "end": {"line": dl, "character": dc + 1}},
+             "message": dm, "severity": ds}
+            for dl, dc, ds, dm in self.lsp_diagnostics if dl == self.cy
+        ]
+        rid = self._lsp_send_request("textDocument/codeAction", {
+            "textDocument": {"uri": f"file://{os.path.abspath(self.filepath)}"},
+            "range": {"start": {"line": self.cy, "character": self.cx},
+                      "end": {"line": self.cy, "character": self.cx}},
+            "context": {"diagnostics": diag_here, "only": []},
+        })
+        for _ in range(60):
+            with self.lsp_lock:
+                if rid in self.lsp_responses:
+                    resp = self.lsp_responses.pop(rid)
+                    result = resp.get("result", []) or []
+                    self.lsp_action_items = []
+                    for action in result:
+                        title = action.get("title", "Unknown action")
+                        cmd = action.get("command")
+                        edit = action.get("edit")
+                        self.lsp_action_items.append((title, cmd, edit))
+                    if self.lsp_action_items:
+                        self._show_code_action_picker()
+                    else:
+                        self.message = "No code actions available"
+                    return
+            time.sleep(0.02)
+        self.message = "LSP: code action timed out"
+
+    def _show_code_action_picker(self):
+        """Show a quick-pick for available code actions (reuses palette UI state)."""
+        if not self.lsp_action_items:
+            return
+        # Reuse the palette overlay for displaying actions
+        self._palette_visible = True
+        self._palette_query = ""
+        self._palette_cursor = 0
+        # Inject action items as palette entries with a special prefix
+        self._palette_items = [
+            {"label": f"⚡ {title}", "_lsp_action": (cmd, edit)}
+            for title, cmd, edit in self.lsp_action_items
+        ]
+        self._palette_filtered = list(self._palette_items)
+        self.message = "Code actions — Enter to apply, Esc to cancel"
+
+    def _apply_lsp_code_action(self, action_item):
+        """Apply a workspace edit from a code action."""
+        cmd, edit = action_item.get("_lsp_action", (None, None))
+        if edit:
+            changes = edit.get("changes", {}) or {}
+            doc_changes = edit.get("documentChanges", []) or []
+            # Process documentChanges first
+            for change in doc_changes:
+                if isinstance(change, dict):
+                    uri = change.get("textDocument", {}).get("uri", "")
+                    fpath = uri.replace("file://", "")
+                    edits = change.get("edits", [])
+                    self._apply_text_edits(fpath, edits)
+            # Then plain changes map
+            for uri, edits in changes.items():
+                fpath = uri.replace("file://", "")
+                self._apply_text_edits(fpath, edits)
+            self.message = "Code action applied"
+        elif cmd:
+            # Execute command on server
+            self._lsp_send_request("workspace/executeCommand", {
+                "command": cmd.get("command") if isinstance(cmd, dict) else cmd,
+                "arguments": cmd.get("arguments", []) if isinstance(cmd, dict) else [],
+            })
+            self.message = f"Code action sent: {cmd}"
+        else:
+            self.message = "Empty code action"
+
+    def _apply_text_edits(self, fpath, edits):
+        """Apply a list of LSP TextEdits to a file (in reverse order to preserve offsets)."""
+        if not fpath:
+            return
+        abs_path = os.path.abspath(fpath)
+        if abs_path == (os.path.abspath(self.filepath) if self.filepath else ""):
+            lines = self.lines
+        elif fpath in self.buffers:
+            lines = self.buffers[fpath]
+        else:
+            try:
+                with open(fpath, encoding="utf-8") as f:
+                    lines = f.read().splitlines()
+            except OSError:
+                return
+        # Sort edits in reverse (bottom-up) to keep offsets valid
+        sorted_edits = sorted(edits, key=lambda e: (
+            e.get("range", {}).get("start", {}).get("line", 0),
+            e.get("range", {}).get("start", {}).get("character", 0),
+        ), reverse=True)
+        for edit in sorted_edits:
+            rng = edit.get("range", {})
+            s = rng.get("start", {})
+            e = rng.get("end", {})
+            sl, sc = s.get("line", 0), s.get("character", 0)
+            el, ec = e.get("line", 0), e.get("character", 0)
+            new_text = edit.get("newText", "")
+            # Flatten selection and replace
+            if sl >= len(lines):
+                continue
+            start_line = lines[sl]
+            end_line = lines[el] if el < len(lines) else ""
+            new_lines = (start_line[:sc] + new_text + end_line[ec:]).split("\n")
+            lines[sl:el + 1] = new_lines
+        if abs_path == (os.path.abspath(self.filepath) if self.filepath else ""):
+            self.lines = lines
+            self.dirty = True
+        elif fpath in self.buffers:
+            self.buffers[fpath] = lines
+
+    # ── LSP Diagnostics Panel ─────────────────────────────────────────────────
+
+    def toggle_diagnostics_panel(self):
+        """Toggle the diagnostics panel (:diagnostics)."""
+        self._diag_panel_visible = not self._diag_panel_visible
+        self._diag_panel_cursor = 0
+        if self._diag_panel_visible:
+            self.message = "Diagnostics panel — j/k to navigate, Enter to jump, q to close"
+
+    def draw_diagnostics_panel(self, stdscr, height, width):
+        """Draw a diagnostics panel at the bottom of the screen."""
+        if not self._diag_panel_visible:
+            return
+        panel_h = min(10, height // 3)
+        panel_y = height - 2 - panel_h
+        panel_w = width
+        # Draw border
+        border_attr = getattr(self, 'color_status', curses.A_REVERSE)
+        title = " ■ Diagnostics "
+        if self.lsp_enabled:
+            title += f"({len(self.lsp_diagnostics)} issues) "
+        try:
+            stdscr.addstr(panel_y, 0, title.ljust(panel_w - 1), border_attr)
+        except curses.error:
+            pass
+        # Draw entries
+        diags = sorted(self.lsp_diagnostics, key=lambda d: (d[2], d[0]))  # sort by severity then line
+        for i in range(panel_h - 1):
+            row = panel_y + 1 + i
+            if row >= height - 2:
+                break
+            idx = i + max(0, self._diag_panel_cursor - panel_h // 2)
+            if idx >= len(diags):
+                try:
+                    stdscr.addstr(row, 0, " " * (panel_w - 1), curses.A_NORMAL)
+                except curses.error:
+                    pass
+                continue
+            dl, dc, ds, dm = diags[idx]
+            sev_labels = {1: "ERR ", 2: "WARN", 3: "INFO", 4: "HINT"}
+            sev_colors = {
+                1: getattr(self, 'color_error_lens', curses.color_pair(2) | curses.A_BOLD),
+                2: getattr(self, 'color_warn_lens', curses.color_pair(8) | curses.A_BOLD),
+                3: getattr(self, 'color_info_lens', curses.color_pair(5)),
+                4: curses.A_DIM,
+            }
+            sev_lbl = sev_labels.get(ds, "?   ")
+            sev_attr = sev_colors.get(ds, curses.A_NORMAL)
+            is_sel = (idx == self._diag_panel_cursor)
+            row_attr = curses.A_REVERSE if is_sel else curses.A_NORMAL
+            fname = os.path.basename(self.filepath) if self.filepath else "?"
+            line_text = f" {sev_lbl} {fname}:{dl + 1}:{dc + 1}  {dm}"
+            line_text = line_text[:panel_w - 1].ljust(panel_w - 1)
+            try:
+                stdscr.addstr(row, 0, line_text, row_attr)
+                # Color the severity label
+                stdscr.addstr(row, 1, sev_lbl, sev_attr | (curses.A_REVERSE if is_sel else curses.A_BOLD))
+            except curses.error:
+                pass
+
+    def handle_diagnostics_panel_key(self, ch):
+        """Handle keypresses when the diagnostics panel is focused."""
+        diags = sorted(self.lsp_diagnostics, key=lambda d: (d[2], d[0]))
+        if ch in (ord('j'), curses.KEY_DOWN):
+            self._diag_panel_cursor = min(self._diag_panel_cursor + 1, max(0, len(diags) - 1))
+        elif ch in (ord('k'), curses.KEY_UP):
+            self._diag_panel_cursor = max(0, self._diag_panel_cursor - 1)
+        elif ch in (curses.KEY_ENTER, 10, 13):
+            if 0 <= self._diag_panel_cursor < len(diags):
+                dl, dc, _, _ = diags[self._diag_panel_cursor]
+                self.cy = dl
+                self.cx = dc
+        elif ch in (ord('q'), 27):
+            self._diag_panel_visible = False
+            self.message = "EVim - normal mode"
+
+    # ── LSP Inlay Hints ───────────────────────────────────────────────────────
+
+    def lsp_request_inlay_hints(self):
+        """Request inlay hints from LSP for the visible range."""
+        if not self.lsp_enabled or not self.lsp_initialized or not self.filepath:
+            return
+        if "inlayHintProvider" not in self.lsp_capabilities:
+            return
+        rid = self._lsp_send_request("textDocument/inlayHint", {
+            "textDocument": {"uri": f"file://{os.path.abspath(self.filepath)}"},
+            "range": {
+                "start": {"line": max(0, self.cy - 20), "character": 0},
+                "end": {"line": min(len(self.lines) - 1, self.cy + 40), "character": 0},
+            },
+        })
+        def _fetch():
+            for _ in range(30):
+                with self.lsp_lock:
+                    if rid in self.lsp_responses:
+                        resp = self.lsp_responses.pop(rid)
+                        hints = resp.get("result") or []
+                        new_hints = {}
+                        for h in hints:
+                            pos = h.get("position", {})
+                            ln = pos.get("line", 0)
+                            col = pos.get("character", 0)
+                            label = h.get("label", "")
+                            if isinstance(label, list):
+                                label = "".join(p.get("value", "") for p in label)
+                            new_hints.setdefault(ln, []).append((col, label))
+                        self.lsp_inlay_hints = new_hints
+                        return
+                time.sleep(0.05)
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def draw_inlay_hints(self, stdscr, row, lineno, full_prefix_len, x_off, editor_w):
+        """Draw inlay hints for a given line (called from redraw)."""
+        if not self.options.get("inlay_hints", True):
+            return
+        hints = self.lsp_inlay_hints.get(lineno, [])
+        if not hints:
+            return
+        hint_attr = curses.A_DIM | getattr(self, 'color_comment', curses.A_DIM)
+        for col, label in hints:
+            hx = x_off + full_prefix_len + col
+            if hx < x_off + editor_w - len(label) - 1:
+                try:
+                    stdscr.addstr(row, hx, f":{label}", hint_attr)
+                except curses.error:
+                    pass
+
+    # ── Session Restore ───────────────────────────────────────────────────────
+
+    def session_save(self):
+        """Save current session to ~/.config/evim/session.json (:mksession)."""
+        self._session_path.parent.mkdir(parents=True, exist_ok=True)
+        session = {
+            "buffers": self.buffer_order,
+            "active": self.filepath,
+            "cursors": {fp: (self.cy if fp == self.filepath else 0,
+                             self.cx if fp == self.filepath else 0)
+                        for fp in self.buffer_order},
+            "options": {k: v for k, v in self.options.items() if isinstance(v, (bool, int, str))},
+        }
+        try:
+            with open(self._session_path, "w", encoding="utf-8") as f:
+                json.dump(session, f, indent=2)
+            self.message = f"Session saved to {self._session_path}"
+        except OSError as exc:
+            self.message = f"Session save error: {exc}"
+
+    def session_restore(self):
+        """Restore session from ~/.config/evim/session.json (:restoresession)."""
+        if not self._session_path.exists():
+            self.message = "No session file found"
+            return
+        try:
+            with open(self._session_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            self.message = f"Session load error: {exc}"
+            return
+        restored = 0
+        for fp in data.get("buffers", []):
+            if fp and fp != "[No Name]" and os.path.exists(fp):
+                self.open_buffer(fp)
+                restored += 1
+        active = data.get("active")
+        if active and active in self.buffers:
+            self.filepath = active
+            self.lines = self.buffers[active][:]
+            cy, cx = data.get("cursors", {}).get(active, (0, 0))
+            self.cy = min(cy, max(0, len(self.lines) - 1))
+            self.cx = cx
+            self.detect_syntax()
+        opts = data.get("options", {})
+        for k, v in opts.items():
+            self.options[k] = v
+        self.message = f"Session restored: {restored} buffers"
+
+    def _session_restore_silent(self):
+        """Auto-restore session on startup (no file specified)."""
+        if not self._session_path.exists():
+            return
+        try:
+            with open(self._session_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return
+        for fp in data.get("buffers", []):
+            if fp and fp != "[No Name]" and os.path.exists(fp):
+                try:
+                    self.open_buffer(fp)
+                except Exception:
+                    pass
+        active = data.get("active")
+        if active and active in self.buffers:
+            self.filepath = active
+            self.lines = self.buffers[active][:]
+            cy, cx = data.get("cursors", {}).get(active, (0, 0))
+            self.cy = min(cy, max(0, len(self.lines) - 1))
+            self.cx = cx
+            self.detect_syntax()
+            self.message = f"Session restored: {os.path.basename(active)}"
+
+    # ── File Watcher ──────────────────────────────────────────────────────────
+
+    def _start_file_watcher(self):
+        """Start background thread that watches open buffers for external changes."""
+        def _watch():
+            while not self.should_exit:
+                time.sleep(2)
+                for fp in list(self.buffers.keys()):
+                    if fp == "[No Name]" or not os.path.exists(fp):
+                        continue
+                    try:
+                        mtime = os.stat(fp).st_mtime
+                    except OSError:
+                        continue
+                    known = self._file_mtimes.get(fp)
+                    if known is None:
+                        self._file_mtimes[fp] = mtime
+                    elif mtime > known + 0.5:
+                        self._file_mtimes[fp] = mtime
+                        # Only reload if not dirty and not the active file being edited
+                        if fp != self.filepath or not self.dirty:
+                            try:
+                                with open(fp, encoding="utf-8", errors="replace") as f:
+                                    new_lines = f.read().splitlines() or [""]
+                                self.buffers[fp] = new_lines
+                                if fp == self.filepath:
+                                    self.lines = new_lines[:]
+                                    self.cy = min(self.cy, len(self.lines) - 1)
+                                    self.cx = min(self.cx, len(self.lines[self.cy]))
+                                    self.message = f"Reloaded: {os.path.basename(fp)}"
+                            except OSError:
+                                pass
+        self._watcher_thread = threading.Thread(target=_watch, daemon=True)
+        self._watcher_thread.start()
+
+    # ── Breadcrumbs ───────────────────────────────────────────────────────────
+
+    def update_breadcrumb(self):
+        """Update the breadcrumb string from the outline items for the current cursor."""
+        if not self._outline_items:
+            self._breadcrumb = ""
+            return
+        # _outline_items are (name, kind, lineno) tuples
+        # Find all symbols whose definition line is at or before the cursor
+        ancestors = []
+        for item in self._outline_items:
+            name, kind, lineno = item
+            if lineno <= self.cy:
+                ancestors.append(name)
+            else:
+                break
+        # Show the last 3 ancestors as breadcrumb
+        if ancestors:
+            self._breadcrumb = " › ".join(ancestors[-3:])
+        else:
+            self._breadcrumb = ""
+
+    # ── Git Integration ───────────────────────────────────────────────────────
+
+    def git_command(self, subcmd, args=""):
+        """Run a git subcommand and show/store the output."""
+        full_cmd = f"git {subcmd} {args}".strip()
+        try:
+            result = subprocess.run(
+                full_cmd, shell=True, capture_output=True, text=True, timeout=15,
+                cwd=os.path.dirname(os.path.abspath(self.filepath)) if self.filepath else ".",
+            )
+            out = (result.stdout or result.stderr or "").strip()
+        except subprocess.TimeoutExpired:
+            self.message = "git: timed out"
+            return
+        except Exception as exc:
+            self.message = f"git error: {exc}"
+            return
+
+        if subcmd in ("status", "log", "diff", "show", "branch", "stash"):
+            self._git_status_lines = out.splitlines() or ["(no output)"]
+            self._git_status_visible = True
+            self._git_status_cursor = 0
+            self.message = f"git {subcmd} — j/k to scroll, q to close"
+        else:
+            # For commit, push, pull, add, etc. just show brief output
+            self.message = (out[:200] if out else f"git {subcmd}: done")
+
+    def draw_git_panel(self, stdscr, height, width):
+        """Draw the git output panel."""
+        if not self._git_status_visible:
+            return
+        panel_h = min(15, height // 2)
+        panel_y = height - 2 - panel_h
+        border_attr = getattr(self, 'color_status', curses.A_REVERSE)
+        title = " ● git output "
+        try:
+            stdscr.addstr(panel_y, 0, title.ljust(width - 1), border_attr)
+        except curses.error:
+            pass
+        visible_lines = self._git_status_lines
+        offset = max(0, self._git_status_cursor - panel_h // 2)
+        for i in range(panel_h - 1):
+            row = panel_y + 1 + i
+            if row >= height - 2:
+                break
+            li = offset + i
+            if li >= len(visible_lines):
+                try:
+                    stdscr.addstr(row, 0, " " * (width - 1))
+                except curses.error:
+                    pass
+                continue
+            text = visible_lines[li][:width - 1].ljust(width - 1)
+            attr = curses.A_REVERSE if li == self._git_status_cursor else curses.A_NORMAL
+            # Simple color coding for git status
+            if text.lstrip().startswith(("M ", "modified")):
+                attr |= getattr(self, 'color_string', curses.A_NORMAL)
+            elif text.lstrip().startswith(("A ", "new file")):
+                attr |= getattr(self, 'color_keyword', curses.A_NORMAL)
+            elif text.lstrip().startswith(("D ", "deleted")):
+                attr |= getattr(self, 'color_preprocessor', curses.A_NORMAL)
+            elif text.lstrip().startswith("??"):
+                attr |= curses.A_DIM
+            elif text.startswith("@@"):
+                attr |= getattr(self, 'color_type', curses.A_NORMAL)
+            elif text.startswith("+"):
+                attr |= getattr(self, 'color_keyword', curses.A_NORMAL)
+            elif text.startswith("-"):
+                attr |= getattr(self, 'color_preprocessor', curses.A_NORMAL)
+            try:
+                stdscr.addstr(row, 0, text, attr)
+            except curses.error:
+                pass
+
+    def handle_git_panel_key(self, ch):
+        """Handle keys when git panel is visible."""
+        if ch in (ord('j'), curses.KEY_DOWN):
+            self._git_status_cursor = min(self._git_status_cursor + 1,
+                                           max(0, len(self._git_status_lines) - 1))
+        elif ch in (ord('k'), curses.KEY_UP):
+            self._git_status_cursor = max(0, self._git_status_cursor - 1)
+        elif ch in (ord('q'), 27):
+            self._git_status_visible = False
+            self.message = "EVim - normal mode"
+        elif ch in (curses.KEY_ENTER, 10, 13):
+            # If cursor is on a file line in status, try to open it
+            if 0 <= self._git_status_cursor < len(self._git_status_lines):
+                line = self._git_status_lines[self._git_status_cursor]
+                # Try to parse file path from git status line
+                parts = line.strip().split()
+                for part in parts:
+                    if os.path.exists(part):
+                        self.open_buffer(part)
+                        self._git_status_visible = False
+                        return
+
+    # ── Remote Editing (SSH) ──────────────────────────────────────────────────
+
+    def open_remote(self, remote_spec):
+        """Open a remote file via SCP: user@host:/path/to/file."""
+        import shutil
+        import tempfile
+        if not shutil.which("scp"):
+            self.message = "scp not found — install openssh-client"
+            return
+        # Parse user@host:/path
+        if ":" not in remote_spec:
+            self.message = f"Invalid remote spec: {remote_spec} (use user@host:/path)"
+            return
+        host_part, remote_path = remote_spec.split(":", 1)
+        # Create a temp file
+        suffix = os.path.splitext(remote_path)[1] or ".txt"
+        tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        self.message = f"Fetching {remote_spec}..."
+        try:
+            result = subprocess.run(
+                ["scp", "-q", f"{host_part}:{remote_path}", tmp_path],
+                capture_output=True, text=True, timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            self.message = "scp: connection timed out"
+            os.unlink(tmp_path)
+            return
+        except Exception as exc:
+            self.message = f"scp error: {exc}"
+            return
+        if result.returncode != 0:
+            self.message = f"scp failed: {(result.stderr or '').strip()[:100]}"
+            os.unlink(tmp_path)
+            return
+        # Store remote info so we can push back on save
+        self._remote_spec = remote_spec
+        self._remote_tmp = tmp_path
+        self.open_buffer(tmp_path)
+        self.message = f"Remote: {remote_spec} (saved locally at {tmp_path})"
+
+    def push_remote(self):
+        """Push current buffer back to the remote server (:wpush)."""
+        remote_spec = getattr(self, "_remote_spec", None)
+        tmp_path = getattr(self, "_remote_tmp", None)
+        if not remote_spec or not tmp_path:
+            self.message = "No remote file open"
+            return
+        # Write local copy first
+        self.write_file()
+        host_part, remote_path = remote_spec.split(":", 1)
+        try:
+            result = subprocess.run(
+                ["scp", "-q", tmp_path, f"{host_part}:{remote_path}"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            self.message = "scp push: timed out"
+            return
+        except Exception as exc:
+            self.message = f"scp push error: {exc}"
+            return
+        if result.returncode == 0:
+            self.message = f"Pushed to {remote_spec}"
+        else:
+            self.message = f"scp push failed: {(result.stderr or '').strip()[:100]}"
+
+
 def print_usage():
     print("Usage: evim [file]")
-    print("  file    File to open (optional)")
+    print("  file    File to open (optional, supports user@host:/path for SSH)")
     print("\nKeyboard shortcuts:")
     print("  :help   Show full help inside editor")
     print("  :lsp    Start language server")
