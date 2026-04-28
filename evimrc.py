@@ -1,7 +1,6 @@
 # evim config file — this is Python!
 # Auto-saved by EVim settings menu (F10)
-# The 'editor' object is available for customization.
-editor = None  # Set by evim.py when loading
+# The 'editor' object is injected automatically — do not reassign it.
 
 # Theme
 editor.set_theme('golden_wheat')
