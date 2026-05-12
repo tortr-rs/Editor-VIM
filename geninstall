@@ -185,7 +185,6 @@ fetch_stage3() {
     in_sha && $2 == file { print $1; exit }
   ' "$digest_file")"
   [[ "$expected_sha512" =~ ^[A-Fa-f0-9]{128}$ ]] || die "Invalid SHA512 format in DIGESTS"
-  [[ -n "$expected_sha512" ]] || die "Could not read SHA512 from DIGESTS"
   printf '%s  %s\n' "$expected_sha512" "/tmp/$(basename "$stage_rel")" | sha512sum -c -
 
   log "Extracting stage3"
@@ -225,7 +224,9 @@ fi
 echo "$TIMEZONE" > /etc/timezone
 emerge --config sys-libs/timezone-data || true
 
-awk -v loc="$LOCALE" '$1 == loc { found=1 } END { exit(found ? 0 : 1) }' /etc/locale.gen || echo "${LOCALE} UTF-8" >> /etc/locale.gen
+if ! awk -v loc="$LOCALE" '$1 == loc { found=1 } END { exit(found ? 0 : 1) }' /etc/locale.gen; then
+  echo "${LOCALE} UTF-8" >> /etc/locale.gen
+fi
 locale-gen
 if ! eselect locale set "$LOCALE"; then
   echo "[chroot] Warning: could not set locale with eselect; check 'eselect locale list' after install"
@@ -258,7 +259,8 @@ if command -v chpasswd >/dev/null 2>&1; then
 root:${ROOT_PASS}
 PASSWD
 else
-  echo "Set root password manually with passwd"
+  echo "[chroot] chpasswd is missing; cannot set root password"
+  exit 1
 fi
 
 if [[ -n "${NEW_USER:-}" ]]; then
