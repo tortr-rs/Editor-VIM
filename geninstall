@@ -75,6 +75,7 @@ prompt_config() {
 
   read -r -p "Create normal user? (leave empty to skip): " NEW_USER
   if [[ -n "$NEW_USER" ]]; then
+    [[ "$NEW_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "Username must match ^[a-z_][a-z0-9_-]*$"
     read -r -s -p "Password for $NEW_USER: " USER_PASS
     echo
     [[ -n "$USER_PASS" ]] || die "User password cannot be empty"
@@ -110,10 +111,12 @@ partition_disk() {
       ROOT_PART="$(part_path "$DISK" 2)"
     fi
   else
-    parted -s "$DISK" mkpart primary ext4 1MiB 100%
+    parted -s "$DISK" mkpart primary 1MiB 3MiB
+    parted -s "$DISK" set 1 bios_grub on
+    parted -s "$DISK" mkpart primary ext4 3MiB 100%
     EFI_PART=""
     SWAP_PART=""
-    ROOT_PART="$(part_path "$DISK" 1)"
+    ROOT_PART="$(part_path "$DISK" 2)"
   fi
 
   partprobe "$DISK"
@@ -161,7 +164,7 @@ fetch_stage3() {
   wget -c -P /tmp "$stage_url"
 
   log "Extracting stage3"
-  tar xpvf "/tmp/$(basename "$stage_rel")" --xattrs-include='*.*' --numeric-owner -C "$MNT"
+  tar xpf "/tmp/$(basename "$stage_rel")" --xattrs-include='*.*' --numeric-owner -C "$MNT"
 }
 
 prepare_chroot() {
@@ -197,9 +200,11 @@ fi
 echo "$TIMEZONE" > /etc/timezone
 emerge --config sys-libs/timezone-data || true
 
-grep -q "^${LOCALE} " /etc/locale.gen || echo "${LOCALE} UTF-8" >> /etc/locale.gen
+grep -Eq "^${LOCALE}([[:space:]]+|$)" /etc/locale.gen || echo "${LOCALE} UTF-8" >> /etc/locale.gen
 locale-gen
-eselect locale set "$LOCALE" || true
+if ! eselect locale set "$LOCALE"; then
+  echo "[chroot] Warning: could not set locale with eselect, continuing"
+fi
 env-update
 
 cat > /etc/fstab <<FSTAB
@@ -232,7 +237,10 @@ fi
 if [[ -n "${NEW_USER:-}" ]]; then
   id "$NEW_USER" >/dev/null 2>&1 || useradd -m -G wheel -s /bin/bash "$NEW_USER"
   echo "${NEW_USER}:${USER_PASS}" | chpasswd
-  grep -q '^%wheel ALL=(ALL:ALL) ALL' /etc/sudoers || echo '%wheel ALL=(ALL:ALL) ALL' >> /etc/sudoers
+  mkdir -p /etc/sudoers.d
+  echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/90-wheel
+  chmod 0440 /etc/sudoers.d/90-wheel
+  visudo -cf /etc/sudoers >/dev/null
 fi
 
 if [[ "$UEFI" == "1" ]]; then
@@ -258,7 +266,7 @@ CHROOT_EOF
   ROOT_PASS="$ROOT_PASS" \
   NEW_USER="$NEW_USER" \
   USER_PASS="$USER_PASS" \
-  arch-chroot "$MNT" /tmp/geninstall-chroot.sh
+  arch-chroot "$MNT" /tmp/geninstall-chroot.sh || die "Chroot installation script failed"
 }
 
 finalize() {
@@ -274,10 +282,10 @@ main() {
   require_cmd lsblk
   require_cmd parted
   require_cmd mkfs.ext4
+  require_cmd mkfs.fat
   require_cmd tar
   require_cmd wget
   require_cmd arch-chroot
-  require_cmd emerge-webrsync || true
 
   trap cleanup EXIT
 
