@@ -100,6 +100,16 @@ ln -s "$(pwd)/evim" ~/.local/bin/evim
 #then run evim 
 ```
 
+### Gentoo bootstrap wrapper from Arch ISO
+
+This repo now includes `geninstall`, an interactive Bash wrapper for bootstrapping a Gentoo base install from an Arch ISO environment:
+
+```bash
+sudo ./geninstall
+```
+
+It guides disk selection/partitioning, stage3 download/extract, chroot setup, base package install, and GRUB configuration.
+
 ## Keybindings
 
 ### Normal Mode

@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+MNT="/mnt/gentoo"
+
+die() {
+  echo "[geninstall] ERROR: $*" >&2
+  exit 1
+}
+
+log() {
+  echo "[geninstall] $*"
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+}
+
+cleanup() {
+  if mountpoint -q "$MNT/dev"; then umount -R "$MNT/dev" || true; fi
+  if mountpoint -q "$MNT/proc"; then umount -R "$MNT/proc" || true; fi
+  if mountpoint -q "$MNT/sys"; then umount -R "$MNT/sys" || true; fi
+  if mountpoint -q "$MNT/run"; then umount -R "$MNT/run" || true; fi
+}
+
+part_path() {
+  local disk="$1" idx="$2"
+  if [[ "$disk" =~ (nvme|mmcblk|loop) ]]; then
+    printf "%sp%s" "$disk" "$idx"
+  else
+    printf "%s%s" "$disk" "$idx"
+  fi
+}
+
+need_root() {
+  [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Run as root"
+}
+
+need_arch_iso() {
+  [[ -f /etc/arch-release ]] || die "This wrapper is intended to run from an Arch ISO/live Arch environment"
+}
+
+pick_disk() {
+  log "Available disks:"
+  lsblk -dpno NAME,SIZE,MODEL | awk '{printf "  %s %s %s\n", $1, $2, substr($0, index($0,$3))}'
+  read -r -p "Target disk (example: /dev/sda): " DISK
+  [[ -b "${DISK:-}" ]] || die "Invalid disk: ${DISK:-<empty>}"
+}
+
+confirm_destroy() {
+  echo
+  echo "WARNING: This will ERASE all data on $DISK"
+  echo "Type exactly: I UNDERSTAND"
+  read -r CONFIRM
+  [[ "$CONFIRM" == "I UNDERSTAND" ]] || die "Confirmation failed"
+}
+
+prompt_config() {
+  read -r -p "Hostname [gentoo]: " HOSTNAME
+  HOSTNAME=${HOSTNAME:-gentoo}
+
+  read -r -p "Timezone [UTC]: " TIMEZONE
+  TIMEZONE=${TIMEZONE:-UTC}
+
+  read -r -p "Locale [en_US.UTF-8]: " LOCALE
+  LOCALE=${LOCALE:-en_US.UTF-8}
+
+  read -r -p "Swap size in GiB (0 to disable) [2]: " SWAP_GIB
+  SWAP_GIB=${SWAP_GIB:-2}
+  [[ "$SWAP_GIB" =~ ^[0-9]+$ ]] || die "Swap size must be a number"
+
+  read -r -s -p "Root password: " ROOT_PASS
+  echo
+  [[ -n "$ROOT_PASS" ]] || die "Root password cannot be empty"
+
+  read -r -p "Create normal user? (leave empty to skip): " NEW_USER
+  if [[ -n "$NEW_USER" ]]; then
+    read -r -s -p "Password for $NEW_USER: " USER_PASS
+    echo
+    [[ -n "$USER_PASS" ]] || die "User password cannot be empty"
+  else
+    USER_PASS=""
+  fi
+}
+
+partition_disk() {
+  UEFI=0
+  [[ -d /sys/firmware/efi ]] && UEFI=1
+
+  log "Partitioning $DISK"
+  swapoff -a || true
+  umount -R "$MNT" 2>/dev/null || true
+
+  parted -s "$DISK" mklabel gpt
+
+  if [[ "$UEFI" -eq 1 ]]; then
+    parted -s "$DISK" mkpart ESP fat32 1MiB 513MiB
+    parted -s "$DISK" set 1 esp on
+    if [[ "$SWAP_GIB" -gt 0 ]]; then
+      local swap_end=$((513 + SWAP_GIB * 1024))
+      parted -s "$DISK" mkpart primary linux-swap 513MiB "${swap_end}MiB"
+      parted -s "$DISK" mkpart primary ext4 "${swap_end}MiB" 100%
+      EFI_PART="$(part_path "$DISK" 1)"
+      SWAP_PART="$(part_path "$DISK" 2)"
+      ROOT_PART="$(part_path "$DISK" 3)"
+    else
+      parted -s "$DISK" mkpart primary ext4 513MiB 100%
+      EFI_PART="$(part_path "$DISK" 1)"
+      SWAP_PART=""
+      ROOT_PART="$(part_path "$DISK" 2)"
+    fi
+  else
+    parted -s "$DISK" mkpart primary ext4 1MiB 100%
+    EFI_PART=""
+    SWAP_PART=""
+    ROOT_PART="$(part_path "$DISK" 1)"
+  fi
+
+  partprobe "$DISK"
+  sleep 2
+}
+
+format_and_mount() {
+  log "Formatting partitions"
+  mkfs.ext4 -F "$ROOT_PART"
+
+  if [[ -n "$SWAP_PART" ]]; then
+    mkswap "$SWAP_PART"
+    swapon "$SWAP_PART"
+  fi
+
+  mkdir -p "$MNT"
+  mount "$ROOT_PART" "$MNT"
+
+  if [[ -n "$EFI_PART" ]]; then
+    mkfs.fat -F32 "$EFI_PART"
+    mkdir -p "$MNT/boot"
+    mount "$EFI_PART" "$MNT/boot"
+  fi
+}
+
+fetch_stage3() {
+  local arch stage_file base stage_rel stage_url
+  arch=$(uname -m)
+  case "$arch" in
+    x86_64) arch="amd64" ;;
+    *) die "Unsupported architecture for this wrapper: $arch" ;;
+  esac
+
+  base="https://distfiles.gentoo.org/releases/${arch}/autobuilds"
+  stage_file="latest-stage3-${arch}-openrc.txt"
+
+  log "Fetching stage3 selector: ${base}/${stage_file}"
+  wget -qO "/tmp/${stage_file}" "${base}/${stage_file}"
+
+  stage_rel=$(awk '!/^#/ && NF {print $1; exit}' "/tmp/${stage_file}")
+  [[ -n "$stage_rel" ]] || die "Could not parse stage3 path"
+
+  stage_url="${base}/${stage_rel}"
+  log "Downloading stage3 tarball"
+  wget -c -P /tmp "$stage_url"
+
+  log "Extracting stage3"
+  tar xpvf "/tmp/$(basename "$stage_rel")" --xattrs-include='*.*' --numeric-owner -C "$MNT"
+}
+
+prepare_chroot() {
+  cp --dereference /etc/resolv.conf "$MNT/etc/resolv.conf"
+
+  mount --types proc /proc "$MNT/proc"
+  mount --rbind /sys "$MNT/sys"
+  mount --make-rslave "$MNT/sys"
+  mount --rbind /dev "$MNT/dev"
+  mount --make-rslave "$MNT/dev"
+  mount --bind /run "$MNT/run"
+  mount --make-slave "$MNT/run"
+
+  cat > "$MNT/tmp/geninstall-chroot.sh" <<'CHROOT_EOF'
+#!/bin/bash
+set -Eeuo pipefail
+
+source /etc/profile || true
+export PS1="(chroot) ${PS1:-}"
+
+: "${HOSTNAME:?}" "${TIMEZONE:?}" "${LOCALE:?}" "${ROOT_PART:?}" "${DISK:?}" "${UEFI:?}"
+
+echo "[chroot] Syncing Gentoo tree"
+emerge-webrsync
+
+emerge --quiet-build=y --verbose --update --newuse --deep @world
+emerge --quiet-build=y --verbose app-admin/sudo net-misc/dhcpcd sys-kernel/gentoo-kernel-bin sys-boot/grub
+
+if [[ "$UEFI" == "1" ]]; then
+  emerge --quiet-build=y --verbose sys-boot/efibootmgr
+fi
+
+echo "$TIMEZONE" > /etc/timezone
+emerge --config sys-libs/timezone-data || true
+
+grep -q "^${LOCALE} " /etc/locale.gen || echo "${LOCALE} UTF-8" >> /etc/locale.gen
+locale-gen
+eselect locale set "$LOCALE" || true
+env-update
+
+cat > /etc/fstab <<FSTAB
+${ROOT_PART}  /      ext4  noatime  0 1
+FSTAB
+
+if [[ -n "${SWAP_PART:-}" ]]; then
+  echo "${SWAP_PART}  none   swap  sw     0 0" >> /etc/fstab
+fi
+
+if [[ "$UEFI" == "1" ]]; then
+  echo "${EFI_PART}   /boot  vfat  defaults  0 2" >> /etc/fstab
+fi
+
+echo "$HOSTNAME" > /etc/hostname
+cat > /etc/hosts <<HOSTS
+127.0.0.1 localhost
+::1       localhost
+127.0.1.1 ${HOSTNAME}.localdomain ${HOSTNAME}
+HOSTS
+
+rc-update add dhcpcd default
+
+if command -v chpasswd >/dev/null 2>&1; then
+  echo "root:${ROOT_PASS}" | chpasswd
+else
+  echo "Set root password manually with passwd"
+fi
+
+if [[ -n "${NEW_USER:-}" ]]; then
+  id "$NEW_USER" >/dev/null 2>&1 || useradd -m -G wheel -s /bin/bash "$NEW_USER"
+  echo "${NEW_USER}:${USER_PASS}" | chpasswd
+  grep -q '^%wheel ALL=(ALL:ALL) ALL' /etc/sudoers || echo '%wheel ALL=(ALL:ALL) ALL' >> /etc/sudoers
+fi
+
+if [[ "$UEFI" == "1" ]]; then
+  grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=Gentoo
+else
+  grub-install "$DISK"
+fi
+grub-mkconfig -o /boot/grub/grub.cfg
+
+echo "[chroot] Base install finished"
+CHROOT_EOF
+
+  chmod +x "$MNT/tmp/geninstall-chroot.sh"
+
+  HOSTNAME="$HOSTNAME" \
+  TIMEZONE="$TIMEZONE" \
+  LOCALE="$LOCALE" \
+  ROOT_PART="$ROOT_PART" \
+  SWAP_PART="$SWAP_PART" \
+  EFI_PART="$EFI_PART" \
+  DISK="$DISK" \
+  UEFI="$UEFI" \
+  ROOT_PASS="$ROOT_PASS" \
+  NEW_USER="$NEW_USER" \
+  USER_PASS="$USER_PASS" \
+  arch-chroot "$MNT" /tmp/geninstall-chroot.sh
+}
+
+finalize() {
+  rm -f "$MNT/tmp/geninstall-chroot.sh" || true
+  cleanup
+  log "Installation complete. You can reboot into Gentoo now."
+}
+
+main() {
+  need_root
+  need_arch_iso
+
+  require_cmd lsblk
+  require_cmd parted
+  require_cmd mkfs.ext4
+  require_cmd tar
+  require_cmd wget
+  require_cmd arch-chroot
+  require_cmd emerge-webrsync || true
+
+  trap cleanup EXIT
+
+  pick_disk
+  confirm_destroy
+  prompt_config
+  partition_disk
+  format_and_mount
+  fetch_stage3
+  prepare_chroot
+  finalize
+}
+
+main "$@"
