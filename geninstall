@@ -113,10 +113,18 @@ partition_disk() {
   else
     parted -s "$DISK" mkpart primary 1MiB 3MiB
     parted -s "$DISK" set 1 bios_grub on
-    parted -s "$DISK" mkpart primary ext4 3MiB 100%
+    if [[ "$SWAP_GIB" -gt 0 ]]; then
+      local swap_end=$((3 + SWAP_GIB * 1024))
+      parted -s "$DISK" mkpart primary linux-swap 3MiB "${swap_end}MiB"
+      parted -s "$DISK" mkpart primary ext4 "${swap_end}MiB" 100%
+      SWAP_PART="$(part_path "$DISK" 2)"
+      ROOT_PART="$(part_path "$DISK" 3)"
+    else
+      parted -s "$DISK" mkpart primary ext4 3MiB 100%
+      SWAP_PART=""
+      ROOT_PART="$(part_path "$DISK" 2)"
+    fi
     EFI_PART=""
-    SWAP_PART=""
-    ROOT_PART="$(part_path "$DISK" 2)"
   fi
 
   partprobe "$DISK"
@@ -240,7 +248,7 @@ if [[ -n "${NEW_USER:-}" ]]; then
   mkdir -p /etc/sudoers.d
   echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/90-wheel
   chmod 0440 /etc/sudoers.d/90-wheel
-  visudo -cf /etc/sudoers >/dev/null
+  visudo -cf /etc/sudoers >/dev/null || { echo "[chroot] sudoers validation failed"; exit 1; }
 fi
 
 if [[ "$UEFI" == "1" ]]; then
