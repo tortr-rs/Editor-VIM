@@ -75,7 +75,7 @@ prompt_config() {
 
   read -r -p "Create normal user? (leave empty to skip): " NEW_USER
   if [[ -n "$NEW_USER" ]]; then
-    [[ "$NEW_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "Username must match ^[a-z_][a-z0-9_-]*$"
+    [[ "$NEW_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "Username must start with lowercase/underscore, then lowercase letters, numbers, underscores, or hyphens"
     read -r -s -p "Password for $NEW_USER: " USER_PASS
     echo
     [[ -n "$USER_PASS" ]] || die "User password cannot be empty"
@@ -128,6 +128,7 @@ partition_disk() {
   fi
 
   partprobe "$DISK"
+  # Wait briefly for kernel to expose new partition nodes.
   sleep 2
 }
 
@@ -151,7 +152,7 @@ format_and_mount() {
 }
 
 fetch_stage3() {
-  local arch stage_file base stage_rel stage_url
+  local arch stage_file base stage_rel stage_url digest_file expected_sha512
   arch=$(uname -m)
   case "$arch" in
     x86_64) arch="amd64" ;;
@@ -170,6 +171,17 @@ fetch_stage3() {
   stage_url="${base}/${stage_rel}"
   log "Downloading stage3 tarball"
   wget -c -P /tmp "$stage_url"
+
+  digest_file="/tmp/$(basename "$stage_rel").DIGESTS"
+  log "Downloading stage3 DIGESTS"
+  wget -qO "$digest_file" "${stage_url}.DIGESTS"
+  expected_sha512="$(awk -v file=\"$(basename "$stage_rel")\" '
+    /^# SHA512 HASH/ { in_sha=1; next }
+    /^#/ && in_sha { in_sha=0 }
+    in_sha && $2 == file { print $1; exit }
+  ' "$digest_file")"
+  [[ -n "$expected_sha512" ]] || die "Could not read SHA512 from DIGESTS"
+  printf '%s  %s\n' "$expected_sha512" "/tmp/$(basename "$stage_rel")" | sha512sum -c -
 
   log "Extracting stage3"
   tar xpf "/tmp/$(basename "$stage_rel")" --xattrs-include='*.*' --numeric-owner -C "$MNT"
@@ -211,7 +223,7 @@ emerge --config sys-libs/timezone-data || true
 grep -Eq "^${LOCALE}([[:space:]]+|$)" /etc/locale.gen || echo "${LOCALE} UTF-8" >> /etc/locale.gen
 locale-gen
 if ! eselect locale set "$LOCALE"; then
-  echo "[chroot] Warning: could not set locale with eselect, continuing"
+  echo "[chroot] Warning: could not set locale with eselect; check 'eselect locale list' after install"
 fi
 env-update
 
@@ -237,18 +249,22 @@ HOSTS
 rc-update add dhcpcd default
 
 if command -v chpasswd >/dev/null 2>&1; then
-  echo "root:${ROOT_PASS}" | chpasswd
+  chpasswd <<PASSWD
+root:${ROOT_PASS}
+PASSWD
 else
   echo "Set root password manually with passwd"
 fi
 
 if [[ -n "${NEW_USER:-}" ]]; then
   id "$NEW_USER" >/dev/null 2>&1 || useradd -m -G wheel -s /bin/bash "$NEW_USER"
-  echo "${NEW_USER}:${USER_PASS}" | chpasswd
+  chpasswd <<PASSWD
+${NEW_USER}:${USER_PASS}
+PASSWD
   mkdir -p /etc/sudoers.d
   echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/90-wheel
   chmod 0440 /etc/sudoers.d/90-wheel
-  visudo -cf /etc/sudoers >/dev/null || { echo "[chroot] sudoers validation failed"; exit 1; }
+  visudo -cf /etc/sudoers || { echo "[chroot] sudoers validation failed; check output above"; exit 1; }
 fi
 
 if [[ "$UEFI" == "1" ]]; then
@@ -293,6 +309,7 @@ main() {
   require_cmd mkfs.fat
   require_cmd tar
   require_cmd wget
+  require_cmd sha512sum
   require_cmd arch-chroot
 
   trap cleanup EXIT
