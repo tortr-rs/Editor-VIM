@@ -128,8 +128,12 @@ partition_disk() {
   fi
 
   partprobe "$DISK"
-  # Wait briefly for kernel to expose new partition nodes.
-  sleep 2
+  # Wait for kernel to expose new partition nodes.
+  if command -v udevadm >/dev/null 2>&1; then
+    udevadm settle
+  else
+    sleep 2
+  fi
 }
 
 format_and_mount() {
@@ -180,6 +184,7 @@ fetch_stage3() {
     /^#/ && in_sha { in_sha=0 }
     in_sha && $2 == file { print $1; exit }
   ' "$digest_file")"
+  [[ "$expected_sha512" =~ ^[A-Fa-f0-9]{128}$ ]] || die "Invalid SHA512 format in DIGESTS"
   [[ -n "$expected_sha512" ]] || die "Could not read SHA512 from DIGESTS"
   printf '%s  %s\n' "$expected_sha512" "/tmp/$(basename "$stage_rel")" | sha512sum -c -
 
@@ -220,7 +225,7 @@ fi
 echo "$TIMEZONE" > /etc/timezone
 emerge --config sys-libs/timezone-data || true
 
-grep -Eq "^${LOCALE}([[:space:]]+|$)" /etc/locale.gen || echo "${LOCALE} UTF-8" >> /etc/locale.gen
+awk -v loc="$LOCALE" '$1 == loc { found=1 } END { exit(found ? 0 : 1) }' /etc/locale.gen || echo "${LOCALE} UTF-8" >> /etc/locale.gen
 locale-gen
 if ! eselect locale set "$LOCALE"; then
   echo "[chroot] Warning: could not set locale with eselect; check 'eselect locale list' after install"
@@ -264,7 +269,11 @@ PASSWD
   mkdir -p /etc/sudoers.d
   echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/90-wheel
   chmod 0440 /etc/sudoers.d/90-wheel
-  visudo -cf /etc/sudoers || { echo "[chroot] sudoers validation failed; check output above"; exit 1; }
+  if ! visudo -cf /etc/sudoers; then
+    rm -f /etc/sudoers.d/90-wheel
+    echo "[chroot] sudoers validation failed; removed /etc/sudoers.d/90-wheel"
+    exit 1
+  fi
 fi
 
 if [[ "$UEFI" == "1" ]]; then
